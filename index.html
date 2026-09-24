@@ -54,10 +54,11 @@
 <body>
 <div id="root"><p id="boot">Loading your shelf…</p></div>
 <script type="text/babel" data-presets="react">
-const { useState, useEffect, useMemo } = React;
+const { useState, useEffect, useMemo, useRef } = React;
 
 const KEY = "boardgame-shelf-v1";
 const ART_KEY = "boardgame-art-v1";
+const SYNC_KEY = "boardgame-sync-v1";
 const CONDITIONS = ["Sealed", "Like new", "Good", "Well-loved"];
 const AGE_OPTIONS = [["0", "Recently"], ["1", "About a year ago"], ["2", "2+ years ago"], ["5", "5+ years ago"]];
 const uid = () => Math.random().toString(36).slice(2, 10);
@@ -104,6 +105,102 @@ const normalize = (g) => {
   if (n.bgg && n.bgg.id && !n.bgg.slug) n.bgg = { id: String(n.bgg.id), slug: "" };
   delete n.estimate; delete n.review; delete n.bggNone;
   return n;
+};
+
+// ---------- Sync through a private GitHub repo ----------
+const b64encode = (str) => {
+  const bytes = new TextEncoder().encode(str);
+  let bin = "";
+  for (let i = 0; i < bytes.length; i += 0x8000) bin += String.fromCharCode.apply(null, bytes.subarray(i, i + 0x8000));
+  return btoa(bin);
+};
+const b64decode = (b64) => {
+  const bin = atob(b64.replace(/\s/g, ""));
+  const bytes = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+  return new TextDecoder().decode(bytes);
+};
+const ghHeaders = (cfg) => ({ Authorization: `Bearer ${cfg.token}`, Accept: "application/vnd.github+json" });
+const ghErr = (r) => { const e = new Error(`GitHub ${r.status}`); e.status = r.status; return e; };
+async function ghGet(cfg, path) {
+  const url = `https://api.github.com/repos/${cfg.repo}/contents/${path}`;
+  const r = await fetch(url, { headers: ghHeaders(cfg), cache: "no-store" });
+  if (r.status === 404) return null;
+  if (!r.ok) throw ghErr(r);
+  const meta = await r.json();
+  let text;
+  if (meta.content && meta.encoding === "base64") text = b64decode(meta.content);
+  else {
+    // Files over 1 MB come back without content; fetch them raw
+    const r2 = await fetch(url, { headers: { ...ghHeaders(cfg), Accept: "application/vnd.github.raw+json" }, cache: "no-store" });
+    if (!r2.ok) throw ghErr(r2);
+    text = await r2.text();
+  }
+  return { json: JSON.parse(text), sha: meta.sha };
+}
+async function ghPut(cfg, path, obj, sha) {
+  const r = await fetch(`https://api.github.com/repos/${cfg.repo}/contents/${path}`, {
+    method: "PUT",
+    headers: { ...ghHeaders(cfg), "Content-Type": "application/json" },
+    body: JSON.stringify({ message: `Update ${path}`, content: b64encode(JSON.stringify(obj)), ...(sha ? { sha } : {}) }),
+  });
+  if (!r.ok) throw ghErr(r);
+  return (await r.json()).content.sha;
+}
+const syncError = (e) =>
+  e.status === 401 ? "GitHub rejected the token. It may have expired. Make a new one and reconnect."
+  : e.status === 403 ? "The token doesn't have permission. It needs Contents: Read and write on the data repo."
+  : e.status === 404 ? "Couldn't find the data repo. Check the name, and that the token was given access to it."
+  : !navigator.onLine ? "You're offline. Changes are saved on this phone and will sync when you're back online."
+  : "Sync didn't go through. It'll try again automatically.";
+
+// Stable comparison so key order never looks like a change
+const stable = (v) =>
+  Array.isArray(v) ? `[${v.map(stable).join(",")}]`
+  : v && typeof v === "object" ? `{${Object.keys(v).sort().filter((k) => v[k] !== undefined).map((k) => JSON.stringify(k) + ":" + stable(v[k])).join(",")}}`
+  : JSON.stringify(v ?? null);
+const tidy = (s) => ({
+  ...s,
+  games: [...(s.games || [])].sort((a, b) => (a.id < b.id ? -1 : 1))
+    .map((g) => ({ ...g, plays: [...(g.plays || [])].sort((a, b) => ((a.date + a.id) < (b.date + b.id) ? -1 : 1)) })),
+});
+const canon = (s) => stable(tidy(s || {}));
+
+// Merge two shelves: plays from both are kept, other edits go to whichever is newer,
+// and deletions (games, plays) stick
+const mergeShelves = (a, b) => {
+  if (!b) return tidy(a);
+  const deleted = { ...(b.deleted || {}), ...(a.deleted || {}) };
+  const byId = {};
+  [...(b.games || []), ...(a.games || [])].forEach((g0) => {
+    const g = normalize(g0);
+    const prev = byId[g.id];
+    if (!prev) { byId[g.id] = g; return; }
+    const newer = (g.updatedAt || 0) >= (prev.updatedAt || 0) ? g : prev;
+    const older = newer === g ? prev : g;
+    const delPlays = [...new Set([...(older.deletedPlays || []), ...(newer.deletedPlays || [])])];
+    const plays = {};
+    [...older.plays, ...newer.plays].forEach((p) => (plays[p.id] = p));
+    byId[g.id] = { ...newer, deletedPlays: delPlays, plays: Object.values(plays) };
+  });
+  const games = Object.values(byId)
+    .filter((g) => !deleted[g.id])
+    .map((g) => ({ ...g, plays: g.plays.filter((p) => !(g.deletedPlays || []).includes(p.id)) }));
+  const artTimes = { ...(b.artTimes || {}) };
+  Object.entries(a.artTimes || {}).forEach(([k, t]) => { if (t > (artTimes[k] || 0)) artTimes[k] = t; });
+  return tidy({ ...b, ...a, games, deleted, artTimes });
+};
+const makeSetupCode = (cfg) => "GS1:" + btoa(JSON.stringify({ repo: cfg.repo, token: cfg.token }));
+const readSetupCode = (code) => {
+  try {
+    const v = JSON.parse(atob(code.trim().replace(/^GS1:/, "")));
+    return v.repo && v.token ? { repo: v.repo, token: v.token } : null;
+  } catch (e) { return null; }
+};
+const sinceLabel = (t) => {
+  if (!t) return "";
+  const s = Math.round((Date.now() - t) / 1000);
+  return s < 60 ? "just now" : s < 3600 ? `${Math.round(s / 60)} min ago` : `${Math.round(s / 3600)} hr ago`;
 };
 
 // ---------- Images ----------
@@ -561,7 +658,7 @@ function Detail({ g, upd, logPlay, remove, artApi }) {
             {plays.slice(0, 8).map((pl) => (
               <li key={pl.id}>
                 {new Date(pl.date + "T12:00:00").toLocaleDateString(undefined, { month: "short", day: "numeric", year: "numeric" })}
-                <button className="x" onClick={() => upd(g.id, (x) => ({ ...x, plays: x.plays.filter((q) => q.id !== pl.id) }))}>Remove</button>
+                <button className="x" onClick={() => upd(g.id, (x) => ({ ...x, plays: x.plays.filter((q) => q.id !== pl.id), deletedPlays: [...(x.deletedPlays || []), pl.id] }))}>Remove</button>
               </li>
             ))}
             {plays.length > 8 && <li style={{ color: "var(--muted)" }}>and {plays.length - 8} earlier plays</li>}
@@ -603,6 +700,19 @@ function App() {
   const [copyText, setCopyText] = useState("");
   const [importText, setImportText] = useState("");
   const [justPlayed, setJustPlayed] = useState(null);
+  const [syncCfg, setSyncCfg] = useState(null);
+  const [sync, setSync] = useState({ state: "off" });
+  const [repoDraft, setRepoDraft] = useState("");
+  const [tokenDraft, setTokenDraft] = useState("");
+  const [codeDraft, setCodeDraft] = useState("");
+  const [setupText, setSetupText] = useState("");
+  const dataRef = useRef(data); dataRef.current = data;
+  const artRef = useRef(art); artRef.current = art;
+  const cfgRef = useRef(null);
+  const lastSynced = useRef("");
+  const busyRef = useRef(false);
+  const againRef = useRef(false);
+  const timerRef = useRef(null);
 
   useEffect(() => {
     (async () => {
@@ -610,7 +720,17 @@ function App() {
         const r = await window.storage.get(KEY);
         if (r && r.value) { const d = JSON.parse(r.value); setData({ ...d, games: (d.games || []).map(normalize) }); }
       } catch (e) { /* first run */ }
-      try { const a = await window.storage.get(ART_KEY); if (a && a.value) setArt(JSON.parse(a.value)); } catch (e) { /* no art yet */ }
+      let loadedArt = {};
+      try { const a = await window.storage.get(ART_KEY); if (a && a.value) { loadedArt = JSON.parse(a.value); setArt(loadedArt); } } catch (e) { /* no art yet */ }
+      // Give existing art a timestamp so it can sync
+      setData((d) => {
+        const missing = Object.keys(loadedArt).filter((id) => !(d.artTimes || {})[id]);
+        return missing.length ? { ...d, artTimes: { ...(d.artTimes || {}), ...Object.fromEntries(missing.map((id) => [id, 1])) } } : d;
+      });
+      try {
+        const s = await window.storage.get(SYNC_KEY);
+        if (s && s.value) { const cfg = JSON.parse(s.value); cfgRef.current = cfg; setSyncCfg(cfg); }
+      } catch (e) { /* sync not set up */ }
       setLoaded(true);
     })();
   }, []);
@@ -618,7 +738,16 @@ function App() {
   useEffect(() => {
     if (!loaded) return;
     window.storage.set(KEY, JSON.stringify(data)).catch(() => setMsg("Couldn't save your last change. Try again in a moment."));
+    if (cfgRef.current && canon(data) !== lastSynced.current) schedule(lastSynced.current ? 3000 : 300);
   }, [data, loaded]);
+
+  // Check for the other phone's changes when the app comes back into view, and every minute while open
+  useEffect(() => {
+    const onVis = () => { if (document.visibilityState === "visible" && cfgRef.current) schedule(200); };
+    document.addEventListener("visibilitychange", onVis);
+    const t = setInterval(() => { if (document.visibilityState === "visible" && cfgRef.current) schedule(0); }, 60000);
+    return () => { document.removeEventListener("visibilitychange", onVis); clearInterval(t); };
+  }, []);
 
   useEffect(() => {
     if (!loaded) return;
@@ -627,25 +756,124 @@ function App() {
 
   useEffect(() => { if (!toast) return; const t = setTimeout(() => setToast(""), 2400); return () => clearTimeout(t); }, [toast]);
 
-  const upd = (id, fn) => setData((d) => ({ ...d, games: d.games.map((g) => (g.id === id ? fn(g) : g)) }));
+  const upd = (id, fn) => setData((d) => ({ ...d, games: d.games.map((g) => (g.id === id ? { ...fn(g), updatedAt: Date.now() } : g)) }));
   const logPlay = (g, date = today()) => {
     upd(g.id, (x) => ({ ...x, plays: [...x.plays, { id: uid(), date }] }));
     setToast(`Logged a play of ${g.name}`);
     setJustPlayed(g.id);
     setTimeout(() => setJustPlayed(null), 1500);
   };
-  const clearArt = (id) => setArt((a) => { const n = { ...a }; delete n[id]; return n; });
-  const remove = (g) => { setData((d) => ({ ...d, games: d.games.filter((x) => x.id !== g.id) })); clearArt(g.id); setOpen(null); setToast(`Removed ${g.name}`); };
+  const putArt = (id, value, onlyIfEmpty = false) => {
+    if (onlyIfEmpty && artRef.current[id]) return;
+    setArt((a) => { const n = { ...a }; if (value) n[id] = value; else delete n[id]; return n; });
+    setData((d) => ({ ...d, artTimes: { ...(d.artTimes || {}), [id]: Date.now() } }));
+  };
+  const clearArt = (id) => putArt(id, null);
+  const remove = (g) => { setData((d) => ({ ...d, games: d.games.filter((x) => x.id !== g.id), deleted: { ...(d.deleted || {}), [g.id]: Date.now() } })); clearArt(g.id); setOpen(null); setToast(`Removed ${g.name}`); };
   const setPhoto = async (g, file) => {
-    try { const d = await shrink(file); setArt((a) => ({ ...a, [g.id]: d })); setBroken((b) => ({ ...b, [g.id]: false })); setToast("Box photo saved"); }
+    try { const d = await shrink(file); putArt(g.id, d); setBroken((b) => ({ ...b, [g.id]: false })); setToast("Box photo saved"); }
     catch (e) { setMsg("That photo couldn't be read. Try a JPG or PNG."); }
   };
-  const setArtUrl = (id, url) => { setArt((a) => ({ ...a, [id]: url })); setBroken((b) => ({ ...b, [id]: false })); setToast("Box art saved"); };
+  const setArtUrl = (id, url) => { putArt(id, url); setBroken((b) => ({ ...b, [id]: false })); setToast("Box art saved"); };
   const backdate = (ids, years) => {
     const date = yearsAgo(years);
-    setData((d) => ({ ...d, games: d.games.map((g) => (ids.includes(g.id) ? { ...g, ownedSince: date } : g)) }));
+    setData((d) => ({ ...d, games: d.games.map((g) => (ids.includes(g.id) ? { ...g, ownedSince: date, updatedAt: Date.now() } : g)) }));
     setToast(`Updated ${ids.length} game${ids.length === 1 ? "" : "s"}`);
   };
+  // ---------- Sync ----------
+  const schedule = (ms) => {
+    clearTimeout(timerRef.current);
+    timerRef.current = setTimeout(() => runSync(), ms);
+  };
+  const runSync = async (attempt = 0) => {
+    const cfg = cfgRef.current;
+    if (!cfg) return;
+    if (busyRef.current) { againRef.current = true; return; }
+    busyRef.current = true;
+    setSync((s) => ({ ...s, state: "syncing" }));
+    try {
+      const remote = await ghGet(cfg, "shelf.json");
+      const local = dataRef.current;
+      const merged = mergeShelves(local, remote ? remote.json : null);
+
+      // Box art lives in its own file and only moves when something changed
+      const localTimes = local.artTimes || {};
+      const remoteTimes = (remote && remote.json.artTimes) || {};
+      const ids = [...new Set([...Object.keys(localTimes), ...Object.keys(remoteTimes)])];
+      const pullIds = ids.filter((id) => (remoteTimes[id] || 0) > (localTimes[id] || 0));
+      const pushIds = ids.filter((id) => (localTimes[id] || 0) > (remoteTimes[id] || 0));
+      if (pullIds.length || pushIds.length) {
+        const ra = await ghGet(cfg, "art.json");
+        const images = { ...((ra && ra.json.images) || {}) };
+        if (pullIds.length) {
+          setArt((a) => {
+            const n = { ...a };
+            pullIds.forEach((id) => { if (images[id]) n[id] = images[id]; else delete n[id]; });
+            return n;
+          });
+        }
+        if (pushIds.length) {
+          const cur = artRef.current;
+          pushIds.forEach((id) => { if (cur[id]) images[id] = cur[id]; else delete images[id]; });
+          await ghPut(cfg, "art.json", { images }, ra && ra.sha);
+        }
+      }
+
+      const mergedCanon = canon(merged);
+      if (!remote || mergedCanon !== canon(remote.json)) await ghPut(cfg, "shelf.json", merged, remote && remote.sha);
+      lastSynced.current = mergedCanon;
+      setData((cur) => mergeShelves(cur, merged));
+      setSync({ state: "ok", at: Date.now() });
+    } catch (e) {
+      // Someone else saved at the same moment: pull their version and try again
+      if ((e.status === 409 || e.status === 422) && attempt < 2) {
+        busyRef.current = false;
+        return runSync(attempt + 1);
+      }
+      setSync({ state: "error", error: syncError(e) });
+    }
+    busyRef.current = false;
+    if (againRef.current) { againRef.current = false; schedule(500); }
+  };
+  const connectSync = async (cfg) => {
+    const clean = { repo: cfg.repo.trim().replace(/^https?:\/\/github\.com\//i, "").replace(/\/+$/, ""), token: cfg.token.trim() };
+    setSync({ state: "syncing" });
+    try {
+      const r = await fetch(`https://api.github.com/repos/${clean.repo}`, { headers: ghHeaders(clean), cache: "no-store" });
+      if (!r.ok) throw ghErr(r);
+      const info = await r.json();
+      if (!info.private) setMsg("Heads up: that repo is public, so anyone could see your shelf data. Make it private in the repo's Settings.");
+      await window.storage.set(SYNC_KEY, JSON.stringify(clean));
+      cfgRef.current = clean;
+      lastSynced.current = "";
+      setSyncCfg(clean);
+      setRepoDraft(""); setTokenDraft(""); setCodeDraft("");
+      setToast("Connected. Syncing your shelf…");
+      runSync();
+    } catch (e) {
+      setSync({ state: "error", error: syncError(e) });
+    }
+  };
+  const disconnectSync = async () => {
+    try { await window.storage.delete(SYNC_KEY); } catch (e) { /* ignore */ }
+    cfgRef.current = null;
+    setSyncCfg(null);
+    setSync({ state: "off" });
+    setSetupText("");
+    setToast("Sync turned off on this phone");
+  };
+  const copySetup = async () => {
+    const code = makeSetupCode(syncCfg);
+    try { await navigator.clipboard.writeText(code); setToast("Setup code copied"); setSetupText(""); }
+    catch (e) { setSetupText(code); }
+  };
+  const syncLine =
+    !syncCfg ? null
+    : sync.state === "syncing" ? "Shared shelf: syncing…"
+    : sync.state === "error" ? "Shared shelf: sync problem, see Shared shelf below."
+    : sync.at ? `Shared shelf: synced ${sinceLabel(sync.at)}.`
+    : "Shared shelf: connected.";
+
   const openGame = (id) => {
     setScanning(false); setTab("shelf"); setQ(""); setOpen(id);
     setTimeout(() => document.getElementById(`g-${id}`)?.scrollIntoView({ behavior: "smooth", block: "center" }), 120);
@@ -667,7 +895,7 @@ function App() {
       upc: code || x.upc,
       bgg: x.bgg?.id ? x.bgg : info?.bggId ? { id: info.bggId, slug: "" } : x.bgg,
     }));
-    if (info?.image) setArt((a) => (a[id] ? a : { ...a, [id]: info.image }));
+    if (info?.image) putArt(id, info.image, true);
   };
   const addFromScan = (info, code, years) => {
     const match = owned.find((g) => (info.bggId && String(g.bgg?.id) === info.bggId) || norm(g.name) === norm(info.name));
@@ -678,11 +906,11 @@ function App() {
       return;
     }
     const g = {
-      id: uid(), name: info.name, condition: "Good", ownedSince: yearsAgo(years), plays: [], keep: false, status: "owned", upc: code,
+      id: uid(), name: info.name, condition: "Good", ownedSince: yearsAgo(years), plays: [], keep: false, status: "owned", upc: code, updatedAt: Date.now(),
       ...(info.bggId ? { bgg: { id: info.bggId, slug: "" } } : {}),
     };
     setData((d) => ({ ...d, games: [...d.games, g] }));
-    if (info.image) setArt((a) => ({ ...a, [g.id]: info.image }));
+    if (info.image) putArt(g.id, info.image);
     setToast(`Added ${info.name}`);
     openGame(g.id);
   };
@@ -693,7 +921,7 @@ function App() {
     const fresh = names.map((name) => ({
       id: uid(), name, condition: bulk ? "Good" : form.condition,
       ownedSince: bulk ? yearsAgo(Number(bulkAge)) : form.ownedSince || today(),
-      plays: [], keep: false, status: "owned",
+      plays: [], keep: false, status: "owned", updatedAt: Date.now(),
     }));
     setData((d) => ({ ...d, games: [...d.games, ...fresh] }));
     setForm({ name: "", condition: "Good", ownedSince: today() });
@@ -758,6 +986,7 @@ function App() {
         <h1>Game shelf</h1>
         <p className="sub">
           {owned.length} game{owned.length === 1 ? "" : "s"} owned. {dusty.length} haven't been played in {data.dustMonths} months.
+          {syncLine && <><br /><button className="x" style={{ padding: 0, color: sync.state === "error" ? "var(--tag)" : "var(--muted)", fontWeight: 600, fontSize: 14 }} onClick={() => runSync()}>{syncLine}</button></>}
         </p>
 
         <div className="tabs" role="tablist">
@@ -843,6 +1072,38 @@ function App() {
                   setImportText(""); setToast("Backup restored");
                 } catch (e) { setMsg("That backup couldn't be read. Paste the full text exactly as copied."); }
               }}>Restore backup</button>
+            </details>
+
+            <details open={!!syncCfg && sync.state === "error"}>
+              <summary>Shared shelf{syncCfg ? ` (syncing with ${syncCfg.repo})` : " (sync between phones)"}</summary>
+              {syncCfg ? (
+                <div style={{ display: "grid", gap: 10 }}>
+                  <p style={{ margin: 0 }}>This shelf syncs with everyone connected to <b>{syncCfg.repo}</b>. {sync.at ? `Last synced ${sinceLabel(sync.at)}.` : ""}</p>
+                  <div className="bar" style={{ margin: 0, flexWrap: "wrap" }}>
+                    <button className="btn ghost" onClick={() => runSync()} disabled={sync.state === "syncing"}>{sync.state === "syncing" ? "Syncing…" : "Sync now"}</button>
+                    <button className="btn ghost" onClick={copySetup}>Copy setup code</button>
+                  </div>
+                  {setupText && <textarea readOnly value={setupText} onFocus={(e) => e.target.select()} style={{ minHeight: 70 }} />}
+                  <p style={{ margin: 0 }}>Send the setup code to someone to share this shelf with them. It includes your access token, so only send it to people you trust.</p>
+                  <button className="x" style={{ justifySelf: "start", padding: 0 }} onClick={disconnectSync}>Turn off sync on this phone</button>
+                </div>
+              ) : (
+                <div style={{ display: "grid", gap: 10 }}>
+                  <label className="f">Got a setup code? Paste it here
+                    <input value={codeDraft} onChange={(e) => setCodeDraft(e.target.value)} placeholder="GS1:…" autoComplete="off" />
+                  </label>
+                  <button className="btn" style={{ justifySelf: "start" }} disabled={!readSetupCode(codeDraft)} onClick={() => connectSync(readSetupCode(codeDraft))}>Connect</button>
+                  <p style={{ margin: "8px 0 0" }}>Or set it up with your own private GitHub repo:</p>
+                  <label className="f">Data repo
+                    <input value={repoDraft} onChange={(e) => setRepoDraft(e.target.value)} placeholder="yourname/game-shelf-data" autoCapitalize="off" autoCorrect="off" />
+                  </label>
+                  <label className="f">Access token
+                    <input type="password" value={tokenDraft} onChange={(e) => setTokenDraft(e.target.value)} placeholder="github_pat_…" autoComplete="off" />
+                  </label>
+                  <button className="btn" style={{ justifySelf: "start" }} disabled={!repoDraft.includes("/") || !tokenDraft.trim()} onClick={() => connectSync({ repo: repoDraft, token: tokenDraft })}>Connect</button>
+                </div>
+              )}
+              {sync.state === "error" && <p style={{ margin: "10px 0 0", color: "var(--tag)" }}>{sync.error}</p>}
             </details>
           </>
         )}
