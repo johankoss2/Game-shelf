@@ -1,0 +1,919 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-title" content="Game Shelf">
+<meta name="theme-color" content="#E9ECE3">
+<title>Game Shelf</title>
+<style>body{margin:0;background:#E9ECE3;font-family:system-ui,sans-serif}#boot{padding:24px;color:#5B6570}</style>
+<script>
+// Device storage (IndexedDB) with the same get/set/delete shape the app uses
+(function () {
+  var dbp;
+  function open() {
+    return new Promise(function (res, rej) {
+      var r = indexedDB.open("game-shelf", 1);
+      r.onupgradeneeded = function () { r.result.createObjectStore("kv"); };
+      r.onsuccess = function () { res(r.result); };
+      r.onerror = function () { rej(r.error); };
+    });
+  }
+  function tx(mode, fn) {
+    dbp = dbp || open();
+    return dbp.then(function (db) {
+      return new Promise(function (res, rej) {
+        var t = db.transaction("kv", mode), req = fn(t.objectStore("kv"));
+        t.oncomplete = function () { res(req && req.result); };
+        t.onerror = function () { rej(t.error); };
+      });
+    });
+  }
+  window.storage = {
+    get: function (key) {
+      return tx("readonly", function (s) { return s.get(key); }).then(function (v) {
+        if (v === undefined) throw new Error("not found");
+        return { key: key, value: v, shared: false };
+      });
+    },
+    set: function (key, value) {
+      return tx("readwrite", function (s) { return s.put(value, key); }).then(function () { return { key: key, value: value, shared: false }; });
+    },
+    delete: function (key) {
+      return tx("readwrite", function (s) { return s.delete(key); }).then(function () { return { key: key, deleted: true, shared: false }; });
+    }
+  };
+  if (navigator.storage && navigator.storage.persist) navigator.storage.persist();
+})();
+</script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.28.4/babel.min.js"></script>
+</head>
+<body>
+<div id="root"><p id="boot">Loading your shelf…</p></div>
+<script type="text/babel" data-presets="react">
+const { useState, useEffect, useMemo } = React;
+
+const KEY = "boardgame-shelf-v1";
+const ART_KEY = "boardgame-art-v1";
+const CONDITIONS = ["Sealed", "Like new", "Good", "Well-loved"];
+const AGE_OPTIONS = [["0", "Recently"], ["1", "About a year ago"], ["2", "2+ years ago"], ["5", "5+ years ago"]];
+const uid = () => Math.random().toString(36).slice(2, 10);
+const today = () => new Date().toISOString().slice(0, 10);
+const yearsAgo = (n) => { const d = new Date(); d.setFullYear(d.getFullYear() - n); return d.toISOString().slice(0, 10); };
+const norm = (s) => (s || "").toLowerCase().replace(/[^a-z0-9]/g, "");
+const daysSince = (d) => Math.max(0, Math.floor((Date.now() - new Date(d + "T12:00:00").getTime()) / 86400000));
+const lastPlayed = (g) => (g.plays.length ? g.plays.map((p) => p.date).sort().at(-1) : null);
+const idleDays = (g) => daysSince(lastPlayed(g) || g.ownedSince);
+const ago = (d) =>
+  d < 1 ? "today" : d < 2 ? "yesterday" : d < 30 ? `${d} days ago` : d < 365
+    ? `${Math.round(d / 30)} month${Math.round(d / 30) === 1 ? "" : "s"} ago`
+    : `${(d / 365).toFixed(1).replace(/\.0$/, "")} years ago`;
+const idleLabel = (g) => {
+  const lp = lastPlayed(g);
+  if (lp) return `Played ${ago(daysSince(lp))}`;
+  const owned = daysSince(g.ownedSince);
+  return owned < 1 ? "Never played, added today" : `Never played, owned since ${ago(owned)}`;
+};
+const sameCode = (a, b) => a && b && a.replace(/^0+/, "") === b.replace(/^0+/, "");
+
+// ---------- Outside links (no keys, no accounts) ----------
+const enc = encodeURIComponent;
+const bggSearch = (name) => `https://boardgamegeek.com/geeksearch.php?action=search&objecttype=boardgame&q=${enc(name)}`;
+const bggUrl = (b) => `https://boardgamegeek.com/boardgame/${b.id}${b.slug ? "/" + b.slug : ""}`;
+const parseBgg = (url) => {
+  const m = (url || "").match(/boardgamegeek\.com\/boardgame(?:expansion)?\/(\d+)(?:\/([^/?#\s]+))?/i);
+  return m ? { id: m[1], slug: m[2] || "" } : null;
+};
+const ebaySold = (name) => `https://www.ebay.com/sch/i.html?_nkw=${enc(name + " board game")}&LH_Sold=1&LH_Complete=1`;
+const fbSearch = (name) => `https://www.facebook.com/marketplace/search/?query=${enc(name + " board game")}`;
+const webSearch = (q) => `https://www.google.com/search?q=${enc(q)}`;
+
+// Rule of thumb from an eBay sold price (eBay buyers also pay shipping; local buyers expect a deal)
+const suggestFrom = (ebay) => ({ garage: Math.max(1, Math.round(ebay * 0.4)), marketplace: Math.max(1, Math.round(ebay * 0.65)) });
+
+// Older data (from the Claude version) used AI estimate ranges; convert to single prices
+const normalize = (g) => {
+  const n = { plays: [], keep: false, status: "owned", condition: "Good", ownedSince: today(), ...g };
+  if (!n.prices && n.estimate) {
+    const mid = (r) => (r ? Math.round((r[0] + r[1]) / 2) : null);
+    n.prices = { garage: mid(n.estimate.garage), marketplace: mid(n.estimate.marketplace) };
+  }
+  if (n.bgg && n.bgg.id && !n.bgg.slug) n.bgg = { id: String(n.bgg.id), slug: "" };
+  delete n.estimate; delete n.review; delete n.bggNone;
+  return n;
+};
+
+// ---------- Images ----------
+const loadImage = (file) =>
+  new Promise((res, rej) => {
+    const img = new Image();
+    const url = URL.createObjectURL(file);
+    img.onload = () => { URL.revokeObjectURL(url); res(img); };
+    img.onerror = rej;
+    img.src = url;
+  });
+const shrink = async (file) => {
+  const img = await loadImage(file);
+  const s = Math.min(1, 240 / Math.max(img.width, img.height));
+  const c = document.createElement("canvas");
+  c.width = Math.round(img.width * s);
+  c.height = Math.round(img.height * s);
+  c.getContext("2d").drawImage(img, 0, 0, c.width, c.height);
+  return c.toDataURL("image/jpeg", 0.72);
+};
+const downscale = async (file, max) => {
+  const img = await loadImage(file).catch(() => null);
+  if (!img) return file;
+  const s = Math.min(1, max / Math.max(img.width, img.height));
+  if (s === 1) return file;
+  const c = document.createElement("canvas");
+  c.width = Math.round(img.width * s);
+  c.height = Math.round(img.height * s);
+  c.getContext("2d").drawImage(img, 0, 0, c.width, c.height);
+  return new Promise((res) => c.toBlob((b) => res(b ? new File([b], "scan.jpg", { type: "image/jpeg" }) : file), "image/jpeg", 0.9));
+};
+
+// ---------- Barcode reading (on the phone, no lookup service) ----------
+let bcLib = null;
+const loadScript = (src) =>
+  new Promise((res, rej) => {
+    const s = document.createElement("script");
+    s.src = src; s.onload = res; s.onerror = rej;
+    document.head.appendChild(s);
+  });
+async function decodeBarcode(file) {
+  if ("BarcodeDetector" in window) {
+    try {
+      const bd = new window.BarcodeDetector({ formats: ["ean_13", "upc_a", "upc_e", "ean_8"] });
+      const r = await bd.detect(await createImageBitmap(file));
+      if (r.length) return r[0].rawValue;
+    } catch (e) { /* fall through */ }
+  }
+  if (!window.Html5Qrcode) {
+    bcLib = bcLib || loadScript("https://cdnjs.cloudflare.com/ajax/libs/html5-qrcode/2.3.8/html5-qrcode.min.js");
+    try { await bcLib; } catch (e) { bcLib = null; throw e; }
+  }
+  let el = document.getElementById("bc-reader");
+  if (!el) {
+    el = document.createElement("div");
+    el.id = "bc-reader";
+    el.style.cssText = "position:absolute;left:-9999px;width:1px;height:1px;overflow:hidden";
+    document.body.appendChild(el);
+  }
+  const F = window.Html5QrcodeSupportedFormats;
+  const h = new window.Html5Qrcode("bc-reader", { formatsToSupport: [F.EAN_13, F.UPC_A, F.UPC_E, F.EAN_8], verbose: false });
+  const small = await downscale(file, 1600);
+  try { return await h.scanFile(small, false); }
+  finally { try { h.clear(); } catch (e) { /* ignore */ } }
+}
+
+const css = `
+@import url('https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:opsz,wght@12..96,500;12..96,800&family=Figtree:wght@400;600;700&display=swap');
+.bg{background:#E9ECE3;min-height:100vh}
+.app{--paper:#E9ECE3;--card:#F7F8F3;--ink:#1D2B3A;--muted:#5B6570;--meeple:#E8A317;--felt:#2F5D50;--tag:#B8412A;--line:#CCD2C4;
+ font-family:Figtree,system-ui,sans-serif;color:var(--ink);max-width:640px;margin:0 auto;padding:22px 16px 90px;padding-top:max(22px,env(safe-area-inset-top));font-size:16px;line-height:1.45}
+h1{font-family:'Bricolage Grotesque',system-ui,sans-serif;font-weight:800;font-size:40px;line-height:1;margin:0 0 6px;letter-spacing:-.02em}
+h2{font-family:'Bricolage Grotesque',system-ui,sans-serif;font-weight:500;font-size:22px;margin:18px 0 8px}
+.sub{color:var(--muted);margin:0 0 18px}
+.hint{margin:4px 0 8px;color:var(--muted);font-size:13.5px}
+.tabs{display:flex;gap:6px;margin-bottom:14px}
+.tab{flex:1;padding:10px;border:2px solid var(--ink);background:transparent;border-radius:10px;font:600 15px Figtree,sans-serif;color:var(--ink)}
+.tab[aria-selected=true]{background:var(--ink);color:var(--paper)}
+.bar{display:flex;gap:8px;margin-bottom:12px;align-items:center}
+input,select,textarea{font:inherit;font-size:16px;color:var(--ink);background:var(--card);border:1.5px solid var(--line);border-radius:8px;padding:9px 10px;width:100%;box-sizing:border-box}
+textarea{min-height:120px}
+button{cursor:pointer;font-family:Figtree,sans-serif}
+button:focus-visible,input:focus-visible,select:focus-visible,textarea:focus-visible,a:focus-visible{outline:3px solid var(--meeple);outline-offset:2px}
+a{color:var(--felt);font-weight:600}
+.btn{border:0;border-radius:8px;padding:10px 14px;font-weight:700;font-size:15px;background:var(--ink);color:var(--paper);white-space:nowrap;text-decoration:none;display:inline-block;text-align:center}
+.btn.ghost{background:transparent;color:var(--ink);border:1.5px solid var(--line)}
+.btn.felt{background:var(--felt);color:#fff}
+.btn.tag{background:var(--tag);color:#fff}
+.btn:disabled{opacity:.5}
+.filebtn{cursor:pointer}
+.list{display:flex;flex-direction:column;gap:8px}
+.game{background:var(--card);border-radius:10px;display:flex;overflow:hidden;border:1px solid var(--line)}
+.thumb{width:58px;height:58px;flex:none;border-radius:6px;background:var(--paper);display:grid;place-items:center;overflow:hidden;margin:8px 0 8px 8px;filter:grayscale(var(--dust-level)) contrast(calc(1 - var(--dust-level) * .15))}
+.thumb.none{background:var(--meeple)}
+.thumb img{width:100%;height:100%;object-fit:contain}
+.thumb span{font-family:'Bricolage Grotesque',sans-serif;font-weight:800;font-size:26px;color:var(--ink)}
+.body{flex:1;min-width:0}
+.row{display:flex;align-items:center;gap:8px;padding:10px 10px 10px 12px}
+.name{flex:1;min-width:0;text-align:left;background:none;border:0;padding:0;color:var(--ink)}
+.name b{display:block;font-size:17px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.name span{font-size:13.5px;color:var(--muted)}
+.played{border:0;border-radius:999px;background:var(--felt);color:#fff;font-weight:700;padding:9px 14px;font-size:14px}
+.played.done{background:var(--meeple);color:var(--ink)}
+.detail{border-top:1px dashed var(--line);padding:12px;display:grid;gap:16px;font-size:15px}
+.two{display:grid;grid-template-columns:1fr 1fr;gap:8px}
+.three{display:grid;grid-template-columns:1fr 1fr 1fr;gap:8px}
+label.f{display:grid;gap:4px;font-size:13.5px;color:var(--muted);font-weight:600}
+.check{display:flex;gap:8px;align-items:center;font-size:15px}
+.check input{width:auto}
+.plays{margin:0;padding:0;list-style:none;display:grid;gap:4px}
+.plays li{display:flex;justify-content:space-between;align-items:center}
+.x{background:none;border:0;color:var(--tag);font-weight:700;padding:4px 8px}
+.price{display:grid;grid-template-columns:1fr 1fr;gap:8px;padding:0 12px 10px}
+.price div{background:var(--paper);border-radius:8px;padding:6px 10px}
+.price small{display:block;color:var(--muted);font-size:12.5px}
+.price strong{font-size:17px}
+.note{padding:0 12px 10px;font-size:13.5px;color:var(--muted);margin:0}
+.totals{background:var(--ink);color:var(--paper);border-radius:12px;padding:14px 16px;margin:14px 0;display:grid;gap:10px}
+.totals .two strong{font-family:'Bricolage Grotesque',sans-serif;font-size:26px;display:block}
+.totals small{opacity:.75}
+.pick{display:flex;align-items:center;gap:10px;background:var(--paper);border:1.5px solid var(--line);border-radius:8px;padding:10px;font-size:16px}
+.msg{background:#FFF4D6;border-left:4px solid var(--meeple);padding:10px 12px;border-radius:6px;margin-bottom:12px;font-size:15px}
+.empty{text-align:center;padding:36px 16px;color:var(--muted)}
+.sheet{background:var(--card);border:2px solid var(--ink);border-radius:12px;padding:14px;display:grid;gap:10px;margin-bottom:14px}
+.toast{position:fixed;left:50%;bottom:max(20px,env(safe-area-inset-bottom));transform:translateX(-50%);background:var(--ink);color:var(--paper);padding:10px 16px;border-radius:999px;font-weight:600;font-size:14px;max-width:90vw}
+.credit{font-size:13px;color:var(--muted);margin-top:18px}
+details{margin-top:24px;color:var(--muted);font-size:14px}
+details[open] summary{margin-bottom:8px}
+@media (prefers-reduced-motion:no-preference){.detail{animation:open .18s ease-out}@keyframes open{from{opacity:0;transform:translateY(-4px)}}}
+`;
+
+// ---------- GameUPC: free crowdsourced barcode -> BGG lookup ----------
+const GAMEUPC = "https://api.gameupc.com/test/upc/";
+const GAMEUPC_HEADERS = { "x-api-key": "test_test_test_test_test" };
+const deviceId = () => {
+  try {
+    let id = localStorage.getItem("gameshelf-device");
+    if (!id) { id = "gameshelf-" + uid() + uid(); localStorage.setItem("gameshelf-device", id); }
+    return id;
+  } catch (e) { return "gameshelf-anon"; }
+};
+async function gameUpc(code, search) {
+  const r = await fetch(GAMEUPC + enc(code) + (search ? `?search=${enc(search)}` : ""), { headers: GAMEUPC_HEADERS });
+  if (!r.ok) throw new Error(`GameUPC ${r.status}`);
+  return r.json();
+}
+const upcGame = (item) => ({
+  name: item.name,
+  bggId: item.id != null ? String(item.id) : null,
+  year: item.published || item.year || null,
+  image: [item.image_url, item.thumbnail_url, item.image, item.thumbnail].find((u) => typeof u === "string" && /^https:\/\//.test(u)) || null,
+  updateUrl: item.update_url || null,
+});
+// Tells GameUPC which game this barcode is, so the next person gets a verified match
+const confirmUpc = (game) => {
+  if (!game.updateUrl) return;
+  fetch(game.updateUrl, {
+    method: "POST",
+    headers: { ...GAMEUPC_HEADERS, "Content-Type": "application/json" },
+    body: JSON.stringify({ user_id: deviceId() }),
+  }).catch(() => {});
+};
+
+function Scanner({ games, onClose, onAdd, onOpen, logPlay, onLink }) {
+  // idle | reading | looking | local | found | choose | manual
+  const [stage, setStage] = useState("idle");
+  const [code, setCode] = useState("");
+  const [manual, setManual] = useState("");
+  const [err, setErr] = useState("");
+  const [name, setName] = useState("");
+  const [age, setAge] = useState("1");
+  const [game, setGame] = useState(null);
+  const [options, setOptions] = useState([]);
+  const [searchTerms, setSearchTerms] = useState("");
+  const [note, setNote] = useState("");
+
+  const ownedMatch = (gm) => gm && games.find((g) => (gm.bggId && String(g.bgg?.id) === gm.bggId) || norm(g.name) === norm(gm.name));
+  const reset = () => { setStage("idle"); setErr(""); setName(""); setManual(""); setCode(""); setGame(null); setOptions([]); setSearchTerms(""); setNote(""); };
+
+  const showGame = (gm) => {
+    setGame(gm);
+    const mine = ownedMatch(gm);
+    if (mine) onLink(mine.id, code || gm._code, gm);
+    setStage("found");
+  };
+
+  const lookup = async (raw) => {
+    const c = (raw || "").replace(/\D/g, "");
+    if (c.length < 8) { setErr("That doesn't look like a full barcode number."); setStage("idle"); return; }
+    setCode(c); setErr("");
+    if (games.find((g) => sameCode(g.upc, c))) { setStage("local"); return; }
+    setStage("looking");
+    try {
+      const data = await gameUpc(c);
+      const list = (data.bgg_info || []).map(upcGame).filter((x) => x.name);
+      if (data.bgg_info_status === "verified" && list.length) {
+        const gm = { ...list[0], _code: c };
+        setGame(gm);
+        const mine = ownedMatch(gm);
+        if (mine) onLink(mine.id, c, gm);
+        setStage("found");
+      } else if (list.length) {
+        setOptions(list.slice(0, 6));
+        setSearchTerms(data.searched_for || "");
+        setStage("choose");
+      } else {
+        setSearchTerms(data.searched_for || "");
+        setNote("The barcode database doesn't know this one yet.");
+        setStage("choose");
+      }
+    } catch (e) {
+      setNote("Couldn't reach the barcode database right now, so name it yourself.");
+      setStage("manual");
+    }
+  };
+
+  const research = async () => {
+    if (!searchTerms.trim()) return;
+    setStage("looking");
+    try {
+      const data = await gameUpc(code, searchTerms.trim());
+      const list = (data.bgg_info || []).map(upcGame).filter((x) => x.name);
+      setOptions(list.slice(0, 6));
+      setNote(list.length ? "" : `Nothing found for "${searchTerms}". Try different words.`);
+    } catch (e) {
+      setNote("Search didn't go through. Try again, or name it yourself.");
+    }
+    setStage("choose");
+  };
+
+  const choose = (gm) => { confirmUpc(gm); showGame(gm); };
+
+  const onPhoto = async (file) => {
+    setStage("reading"); setErr("");
+    try { await lookup(await decodeBarcode(file)); }
+    catch (e) {
+      setErr("Couldn't read a barcode in that photo. Get close so the barcode fills most of the frame, keep it flat, and avoid glare. Or type the numbers under the bars below.");
+      setStage("idle");
+    }
+  };
+
+  const local = code ? games.find((g) => sameCode(g.upc, code)) : null;
+  const mine = stage === "found" ? ownedMatch(game) : null;
+  const nameMatch = name.trim() ? games.find((g) => norm(g.name) === norm(name)) : null;
+  const ageSelect = (
+    <label className="f">When did you get it?
+      <select value={age} onChange={(e) => setAge(e.target.value)}>
+        {AGE_OPTIONS.map(([v, l]) => <option key={v} value={v}>{l}</option>)}
+      </select>
+    </label>
+  );
+  const onShelf = (g) => (
+    <>
+      <p style={{ margin: 0 }}>Already on your shelf.</p>
+      <div className="bar" style={{ margin: 0, flexWrap: "wrap" }}>
+        <button className="btn felt" onClick={() => { logPlay(g); onClose(); }}>Log a play</button>
+        <button className="btn ghost" onClick={() => onOpen(g.id)}>Open it</button>
+        {g.bgg?.id && <a className="btn ghost" href={bggUrl(g.bgg)} target="_blank" rel="noreferrer">View on BGG</a>}
+      </div>
+    </>
+  );
+  const again = <button className="x" style={{ justifySelf: "start", padding: 0, color: "var(--ink)" }} onClick={reset}>Scan another</button>;
+
+  return (
+    <div className="sheet">
+      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+        <b style={{ fontSize: 17 }}>Scan a barcode</b>
+        <button className="x" onClick={onClose}>Close</button>
+      </div>
+
+      {stage === "idle" && (
+        <>
+          <label className="btn felt filebtn" style={{ padding: 14 }}>
+            Take a photo of the barcode
+            <input type="file" accept="image/*" capture="environment" hidden onChange={(e) => { const f = e.target.files[0]; e.target.value = ""; f && onPhoto(f); }} />
+          </label>
+          <div className="bar" style={{ margin: 0 }}>
+            <input inputMode="numeric" placeholder="Or type the barcode numbers" value={manual} onChange={(e) => setManual(e.target.value)} onKeyDown={(e) => e.key === "Enter" && lookup(manual)} aria-label="Barcode number" />
+            <button className="btn ghost" onClick={() => lookup(manual)}>Go</button>
+          </div>
+          {err && <p style={{ margin: 0, color: "var(--tag)", fontSize: 14 }}>{err}</p>}
+        </>
+      )}
+
+      {stage === "reading" && <p style={{ margin: 0 }} role="status">Reading the barcode…</p>}
+      {stage === "looking" && <p style={{ margin: 0 }} role="status">Looking up {code}…</p>}
+
+      {stage === "local" && local && (
+        <>
+          <div className="pick"><b>{local.name}</b></div>
+          {onShelf(local)}
+          {again}
+        </>
+      )}
+
+      {stage === "found" && game && (
+        <>
+          <div className="pick">
+            {game.image && <img src={game.image} alt="" style={{ width: 48, height: 48, objectFit: "contain" }} onError={(e) => (e.target.style.display = "none")} />}
+            <span><b>{game.name}</b>{game.year ? ` (${game.year})` : ""}</span>
+          </div>
+          {mine ? onShelf(mine) : (
+            <>
+              {ageSelect}
+              <div className="bar" style={{ margin: 0, flexWrap: "wrap" }}>
+                <button className="btn" onClick={() => onAdd(game, code, Number(age))}>Add to shelf</button>
+                {game.bggId && <a className="btn ghost" href={bggUrl({ id: game.bggId })} target="_blank" rel="noreferrer">View on BGG</a>}
+              </div>
+            </>
+          )}
+          <button className="x" style={{ justifySelf: "start", padding: 0 }} onClick={() => { setName(""); setStage("manual"); }}>Wrong game?</button>
+          {again}
+        </>
+      )}
+
+      {stage === "choose" && (
+        <>
+          <p style={{ margin: 0 }}>{note || "Which game is this? Your pick also helps confirm it in the shared barcode database."}</p>
+          {options.map((o, i) => (
+            <button key={i} className="pick" style={{ textAlign: "left", cursor: "pointer", color: "var(--ink)" }} onClick={() => choose(o)}>
+              {o.image && <img src={o.image} alt="" style={{ width: 44, height: 44, objectFit: "contain" }} onError={(e) => (e.target.style.display = "none")} />}
+              <span><b>{o.name}</b>{o.year ? ` (${o.year})` : ""}</span>
+            </button>
+          ))}
+          <div className="bar" style={{ margin: 0 }}>
+            <input placeholder="Search by name" value={searchTerms} onChange={(e) => setSearchTerms(e.target.value)} onKeyDown={(e) => e.key === "Enter" && research()} aria-label="Search by name" />
+            <button className="btn ghost" onClick={research}>Search</button>
+          </div>
+          <button className="x" style={{ justifySelf: "start", padding: 0 }} onClick={() => setStage("manual")}>Just type the name myself</button>
+          {again}
+        </>
+      )}
+
+      {stage === "manual" && (
+        <>
+          <p style={{ margin: 0 }}>{note || `Name barcode ${code} once and future scans of this box will find it instantly.`}</p>
+          <a className="btn ghost" href={webSearch(`${code} board game`)} target="_blank" rel="noreferrer">Look up this barcode on the web</a>
+          <label className="f">Game name
+            <input list="owned-names" value={name} onChange={(e) => setName(e.target.value)} placeholder="Type or pick from your shelf" />
+            <datalist id="owned-names">{games.map((g) => <option key={g.id} value={g.name} />)}</datalist>
+          </label>
+          {!nameMatch && ageSelect}
+          <button className="btn" disabled={!name.trim()} onClick={() => onAdd({ name: name.trim() }, code, Number(age))}>
+            {nameMatch ? `Link barcode to ${nameMatch.name}` : "Add to shelf"}
+          </button>
+          {again}
+        </>
+      )}
+    </div>
+  );
+}
+
+function Detail({ g, upd, logPlay, remove, artApi }) {
+  const [pastDate, setPastDate] = useState(today());
+  const [soldFor, setSoldFor] = useState("");
+  const [bggLink, setBggLink] = useState("");
+  const [imgLink, setImgLink] = useState("");
+  const plays = [...g.plays].sort((a, b) => b.date.localeCompare(a.date));
+  const { hasArt, broken, setPhoto, setArtUrl, clearArt } = artApi;
+  const p = g.prices || {};
+  const setPrice = (k, v) => upd(g.id, (x) => ({ ...x, prices: { ...(x.prices || {}), [k]: v === "" ? null : Number(v) } }));
+  const sugg = p.ebay ? suggestFrom(p.ebay) : null;
+
+  return (
+    <div className="detail">
+      <label className="f">Title
+        <input value={g.name} onChange={(e) => upd(g.id, (x) => ({ ...x, name: e.target.value }))} />
+      </label>
+
+      <div>
+        <label className="f">BoardGameGeek</label>
+        {g.bgg?.id ? (
+          <div className="bar" style={{ margin: "6px 0 0" }}>
+            <a className="btn ghost" href={bggUrl(g.bgg)} target="_blank" rel="noreferrer">Open on BGG</a>
+            <button className="x" onClick={() => upd(g.id, (x) => ({ ...x, bgg: undefined }))}>Unlink</button>
+          </div>
+        ) : (
+          <>
+            <p className="hint">Find the game on BGG, copy the page link, and paste it here. After that it's one tap.</p>
+            <a className="btn ghost" href={bggSearch(g.name)} target="_blank" rel="noreferrer">Find on BGG</a>
+            <div className="bar" style={{ margin: "8px 0 0" }}>
+              <input placeholder="Paste BGG page link" value={bggLink} onChange={(e) => setBggLink(e.target.value.trim())} aria-label="BGG page link" />
+              <button className="btn ghost" disabled={!parseBgg(bggLink)} onClick={() => { upd(g.id, (x) => ({ ...x, bgg: parseBgg(bggLink) })); setBggLink(""); }}>Save</button>
+            </div>
+            {bggLink && !parseBgg(bggLink) && <p className="hint" style={{ color: "var(--tag)" }}>That doesn't look like a BGG game page link.</p>}
+          </>
+        )}
+      </div>
+
+      <div>
+        <label className="f">Box art</label>
+        <div className="bar" style={{ margin: "6px 0 0", flexWrap: "wrap" }}>
+          <label className="btn ghost filebtn">
+            {hasArt ? "Replace with photo" : "Take a photo"}
+            <input type="file" accept="image/*" hidden onChange={(e) => { const f = e.target.files[0]; e.target.value = ""; f && setPhoto(g, f); }} />
+          </label>
+          {hasArt && <button className="x" onClick={() => clearArt(g.id)}>Remove art</button>}
+        </div>
+        {broken && <p className="hint" style={{ color: "var(--tag)" }}>That image link won't load. Try a photo or a different link.</p>}
+        <div className="bar" style={{ margin: "8px 0 0" }}>
+          <input placeholder="Or paste an image link" value={imgLink} onChange={(e) => setImgLink(e.target.value.trim())} aria-label="Image link" />
+          <button className="btn ghost" disabled={!/^https:\/\//.test(imgLink)} onClick={() => { setArtUrl(g.id, imgLink); setImgLink(""); }}>Save</button>
+        </div>
+        <p className="hint">On the BGG page, long-press the box image, choose Open in New Tab, then copy that tab's address.</p>
+      </div>
+
+      <div>
+        <label className="f">Prices</label>
+        <div className="bar" style={{ margin: "6px 0 10px", flexWrap: "wrap" }}>
+          <a className="btn ghost" href={ebaySold(g.name)} target="_blank" rel="noreferrer">eBay sold prices</a>
+          <a className="btn ghost" href={fbSearch(g.name)} target="_blank" rel="noreferrer">Marketplace listings</a>
+        </div>
+        <div className="three">
+          <label className="f">eBay sold
+            <input inputMode="decimal" placeholder="$" value={p.ebay ?? ""} onChange={(e) => setPrice("ebay", e.target.value.replace(/[^0-9.]/g, ""))} />
+          </label>
+          <label className="f">Garage sale
+            <input inputMode="decimal" placeholder="$" value={p.garage ?? ""} onChange={(e) => setPrice("garage", e.target.value.replace(/[^0-9.]/g, ""))} />
+          </label>
+          <label className="f">Marketplace
+            <input inputMode="decimal" placeholder="$" value={p.marketplace ?? ""} onChange={(e) => setPrice("marketplace", e.target.value.replace(/[^0-9.]/g, ""))} />
+          </label>
+        </div>
+        {sugg && (sugg.garage !== p.garage || sugg.marketplace !== p.marketplace) && (
+          <button className="btn ghost" style={{ marginTop: 8 }} onClick={() => upd(g.id, (x) => ({ ...x, prices: { ...x.prices, ...sugg } }))}>
+            Fill in ${sugg.garage} garage, ${sugg.marketplace} Marketplace
+          </button>
+        )}
+        <p className="hint">Look at a few recent eBay sales and enter a typical one. The fill-in button uses a rule of thumb: about 40% of eBay for a garage sale and 65% for Marketplace, since local buyers skip shipping and expect a deal. Adjust to taste.</p>
+      </div>
+
+      <div className="two">
+        <label className="f">Condition
+          <select value={g.condition} onChange={(e) => upd(g.id, (x) => ({ ...x, condition: e.target.value }))}>
+            {CONDITIONS.map((c) => <option key={c}>{c}</option>)}
+          </select>
+        </label>
+        <label className="f">Owned since
+          <input type="date" value={g.ownedSince} onChange={(e) => e.target.value && upd(g.id, (x) => ({ ...x, ownedSince: e.target.value }))} />
+        </label>
+      </div>
+      <label className="check">
+        <input type="checkbox" checked={!!g.keep} onChange={(e) => upd(g.id, (x) => ({ ...x, keep: e.target.checked }))} />
+        Keeper (never suggest selling this one)
+      </label>
+
+      <div>
+        <label className="f">Log a play on another date</label>
+        <div className="bar" style={{ marginTop: 4 }}>
+          <input type="date" value={pastDate} max={today()} onChange={(e) => setPastDate(e.target.value)} />
+          <button className="btn felt" onClick={() => pastDate && logPlay(g, pastDate)}>Log play</button>
+        </div>
+        {plays.length > 0 && (
+          <ul className="plays">
+            {plays.slice(0, 8).map((pl) => (
+              <li key={pl.id}>
+                {new Date(pl.date + "T12:00:00").toLocaleDateString(undefined, { month: "short", day: "numeric", year: "numeric" })}
+                <button className="x" onClick={() => upd(g.id, (x) => ({ ...x, plays: x.plays.filter((q) => q.id !== pl.id) }))}>Remove</button>
+              </li>
+            ))}
+            {plays.length > 8 && <li style={{ color: "var(--muted)" }}>and {plays.length - 8} earlier plays</li>}
+          </ul>
+        )}
+        <p className="hint" style={{ marginBottom: 0 }}>{g.plays.length} play{g.plays.length === 1 ? "" : "s"} logged</p>
+      </div>
+
+      <div>
+        <label className="f">Sold it? Record the price</label>
+        <div className="bar" style={{ marginTop: 4 }}>
+          <input inputMode="decimal" placeholder="$" value={soldFor} onChange={(e) => setSoldFor(e.target.value.replace(/[^0-9.]/g, ""))} />
+          <button className="btn tag" onClick={() => upd(g.id, (x) => ({ ...x, status: "sold", soldFor: Number(soldFor) || 0, soldOn: today() }))}>Mark sold</button>
+        </div>
+      </div>
+      <button className="x" style={{ justifySelf: "start", padding: 0 }} onClick={() => remove(g)}>Delete game from shelf</button>
+    </div>
+  );
+}
+
+function App() {
+  const [data, setData] = useState({ games: [], dustMonths: 12 });
+  const [art, setArt] = useState({});
+  const [broken, setBroken] = useState({});
+  const [loaded, setLoaded] = useState(false);
+  const [tab, setTab] = useState("shelf");
+  const [open, setOpen] = useState(null);
+  const [adding, setAdding] = useState(false);
+  const [scanning, setScanning] = useState(false);
+  const [bulk, setBulk] = useState(false);
+  const [form, setForm] = useState({ name: "", condition: "Good", ownedSince: today() });
+  const [bulkText, setBulkText] = useState("");
+  const [bulkAge, setBulkAge] = useState("1");
+  const [fixAge, setFixAge] = useState("1");
+  const [q, setQ] = useState("");
+  const [sort, setSort] = useState("name");
+  const [msg, setMsg] = useState("");
+  const [toast, setToast] = useState("");
+  const [copyText, setCopyText] = useState("");
+  const [importText, setImportText] = useState("");
+  const [justPlayed, setJustPlayed] = useState(null);
+
+  useEffect(() => {
+    (async () => {
+      try {
+        const r = await window.storage.get(KEY);
+        if (r && r.value) { const d = JSON.parse(r.value); setData({ ...d, games: (d.games || []).map(normalize) }); }
+      } catch (e) { /* first run */ }
+      try { const a = await window.storage.get(ART_KEY); if (a && a.value) setArt(JSON.parse(a.value)); } catch (e) { /* no art yet */ }
+      setLoaded(true);
+    })();
+  }, []);
+
+  useEffect(() => {
+    if (!loaded) return;
+    window.storage.set(KEY, JSON.stringify(data)).catch(() => setMsg("Couldn't save your last change. Try again in a moment."));
+  }, [data, loaded]);
+
+  useEffect(() => {
+    if (!loaded) return;
+    window.storage.set(ART_KEY, JSON.stringify(art)).catch(() => setMsg("Couldn't save box art. Try again in a moment."));
+  }, [art, loaded]);
+
+  useEffect(() => { if (!toast) return; const t = setTimeout(() => setToast(""), 2400); return () => clearTimeout(t); }, [toast]);
+
+  const upd = (id, fn) => setData((d) => ({ ...d, games: d.games.map((g) => (g.id === id ? fn(g) : g)) }));
+  const logPlay = (g, date = today()) => {
+    upd(g.id, (x) => ({ ...x, plays: [...x.plays, { id: uid(), date }] }));
+    setToast(`Logged a play of ${g.name}`);
+    setJustPlayed(g.id);
+    setTimeout(() => setJustPlayed(null), 1500);
+  };
+  const clearArt = (id) => setArt((a) => { const n = { ...a }; delete n[id]; return n; });
+  const remove = (g) => { setData((d) => ({ ...d, games: d.games.filter((x) => x.id !== g.id) })); clearArt(g.id); setOpen(null); setToast(`Removed ${g.name}`); };
+  const setPhoto = async (g, file) => {
+    try { const d = await shrink(file); setArt((a) => ({ ...a, [g.id]: d })); setBroken((b) => ({ ...b, [g.id]: false })); setToast("Box photo saved"); }
+    catch (e) { setMsg("That photo couldn't be read. Try a JPG or PNG."); }
+  };
+  const setArtUrl = (id, url) => { setArt((a) => ({ ...a, [id]: url })); setBroken((b) => ({ ...b, [id]: false })); setToast("Box art saved"); };
+  const backdate = (ids, years) => {
+    const date = yearsAgo(years);
+    setData((d) => ({ ...d, games: d.games.map((g) => (ids.includes(g.id) ? { ...g, ownedSince: date } : g)) }));
+    setToast(`Updated ${ids.length} game${ids.length === 1 ? "" : "s"}`);
+  };
+  const openGame = (id) => {
+    setScanning(false); setTab("shelf"); setQ(""); setOpen(id);
+    setTimeout(() => document.getElementById(`g-${id}`)?.scrollIntoView({ behavior: "smooth", block: "center" }), 120);
+  };
+
+  const threshold = data.dustMonths * 30;
+  const owned = data.games.filter((g) => g.status !== "sold");
+  const sold = data.games.filter((g) => g.status === "sold");
+  const dusty = owned.filter((g) => !g.keep && idleDays(g) >= threshold).sort((a, b) => idleDays(b) - idleDays(a));
+  const newbies = owned.filter((g) => !g.plays.length && daysSince(g.ownedSince) < 30);
+  const shelf = useMemo(() => {
+    const f = owned.filter((g) => g.name.toLowerCase().includes(q.toLowerCase()));
+    return sort === "name" ? f.sort((a, b) => a.name.localeCompare(b.name)) : f.sort((a, b) => idleDays(b) - idleDays(a));
+  }, [data, q, sort]);
+
+  const linkScan = (id, code, info) => {
+    upd(id, (x) => ({
+      ...x,
+      upc: code || x.upc,
+      bgg: x.bgg?.id ? x.bgg : info?.bggId ? { id: info.bggId, slug: "" } : x.bgg,
+    }));
+    if (info?.image) setArt((a) => (a[id] ? a : { ...a, [id]: info.image }));
+  };
+  const addFromScan = (info, code, years) => {
+    const match = owned.find((g) => (info.bggId && String(g.bgg?.id) === info.bggId) || norm(g.name) === norm(info.name));
+    if (match) {
+      linkScan(match.id, code, info);
+      setToast(`Barcode linked to ${match.name}`);
+      openGame(match.id);
+      return;
+    }
+    const g = {
+      id: uid(), name: info.name, condition: "Good", ownedSince: yearsAgo(years), plays: [], keep: false, status: "owned", upc: code,
+      ...(info.bggId ? { bgg: { id: info.bggId, slug: "" } } : {}),
+    };
+    setData((d) => ({ ...d, games: [...d.games, g] }));
+    if (info.image) setArt((a) => ({ ...a, [g.id]: info.image }));
+    setToast(`Added ${info.name}`);
+    openGame(g.id);
+  };
+
+  const addGames = () => {
+    const names = bulk ? bulkText.split("\n").map((s) => s.trim()).filter(Boolean) : [form.name.trim()].filter(Boolean);
+    if (!names.length) return;
+    const fresh = names.map((name) => ({
+      id: uid(), name, condition: bulk ? "Good" : form.condition,
+      ownedSince: bulk ? yearsAgo(Number(bulkAge)) : form.ownedSince || today(),
+      plays: [], keep: false, status: "owned",
+    }));
+    setData((d) => ({ ...d, games: [...d.games, ...fresh] }));
+    setForm({ name: "", condition: "Good", ownedSince: today() });
+    setBulkText("");
+    setAdding(false);
+    setToast(`Added ${names.length} game${names.length === 1 ? "" : "s"}`);
+  };
+
+  const priced = dusty.filter((g) => g.prices && (g.prices.garage || g.prices.marketplace));
+  const sum = (k) => priced.reduce((s, g) => s + (g.prices[k] || 0), 0);
+  const soldTotal = sold.reduce((s, g) => s + (g.soldFor || 0), 0);
+
+  const copyListing = async () => {
+    const lines = priced.map((g) => `${g.name}, ${g.condition.toLowerCase()}: $${g.prices.marketplace || g.prices.garage}`);
+    const text = `Board games for sale. Pickup only, cash or Venmo. Message me with questions.\n\n${lines.join("\n")}`;
+    try { await navigator.clipboard.writeText(text); setToast("Listing copied"); setCopyText(""); }
+    catch (e) { setCopyText(text); }
+  };
+
+  const renderCard = (g, sale) => {
+    const level = Math.min(1, idleDays(g) / threshold);
+    const isOpen = open === g.id;
+    const showArt = art[g.id] && !broken[g.id];
+    const p = g.prices || {};
+    return (
+      <div className="game" key={g.id} id={`g-${g.id}`}>
+        <div className={`thumb ${showArt ? "" : "none"}`} style={{ "--dust-level": level }} aria-hidden="true">
+          {showArt
+            ? <img src={art[g.id]} alt="" onError={() => setBroken((b) => ({ ...b, [g.id]: true }))} />
+            : <span>{g.name.charAt(0).toUpperCase()}</span>}
+        </div>
+        <div className="body">
+          <div className="row">
+            <button className="name" aria-expanded={isOpen} onClick={() => setOpen(isOpen ? null : g.id)}>
+              <b>{g.name}</b>
+              <span>{idleLabel(g)}{sale ? `, ${g.condition.toLowerCase()}` : ""}</span>
+            </button>
+            <button className={`played ${justPlayed === g.id ? "done" : ""}`} onClick={() => logPlay(g)}>
+              {justPlayed === g.id ? "Logged" : "Played"}
+            </button>
+          </div>
+          {sale && (p.garage || p.marketplace) ? (
+            <div className="price">
+              <div><small>Garage sale</small><strong>{p.garage ? `$${p.garage}` : "—"}</strong></div>
+              <div><small>Marketplace</small><strong>{p.marketplace ? `$${p.marketplace}` : "—"}</strong></div>
+            </div>
+          ) : sale && !isOpen ? (
+            <p className="note">No prices yet. Tap the name to check eBay and set them.</p>
+          ) : null}
+          {isOpen && <Detail g={g} upd={upd} logPlay={logPlay} remove={remove} artApi={{ hasArt: !!art[g.id], broken: !!broken[g.id], setPhoto, setArtUrl, clearArt }} />}
+        </div>
+      </div>
+    );
+  };
+
+  if (!loaded) return <div className="bg"><div className="app"><style>{css}</style><p className="sub">Loading your shelf…</p></div></div>;
+
+  return (
+    <div className="bg">
+      <div className="app">
+        <style>{css}</style>
+        <h1>Game shelf</h1>
+        <p className="sub">
+          {owned.length} game{owned.length === 1 ? "" : "s"} owned. {dusty.length} haven't been played in {data.dustMonths} months.
+        </p>
+
+        <div className="tabs" role="tablist">
+          <button className="tab" role="tab" aria-selected={tab === "shelf"} onClick={() => setTab("shelf")}>Shelf</button>
+          <button className="tab" role="tab" aria-selected={tab === "dust"} onClick={() => setTab("dust")}>Not getting played ({dusty.length})</button>
+        </div>
+
+        {msg && <div className="msg" role="status">{msg} <button className="x" onClick={() => setMsg("")}>Dismiss</button></div>}
+
+        {tab === "shelf" && (
+          <>
+            {adding ? (
+              <div className="sheet">
+                <div className="bar" style={{ margin: 0 }}>
+                  <button className={`btn ${bulk ? "ghost" : ""}`} onClick={() => setBulk(false)}>One game</button>
+                  <button className={`btn ${bulk ? "" : "ghost"}`} onClick={() => setBulk(true)}>Paste a list</button>
+                </div>
+                {bulk ? (
+                  <>
+                    <label className="f">One game per line
+                      <textarea value={bulkText} onChange={(e) => setBulkText(e.target.value)} placeholder={"Catan\nTicket to Ride\nWingspan"} />
+                    </label>
+                    <label className="f">When did you get these?
+                      <select value={bulkAge} onChange={(e) => setBulkAge(e.target.value)}>
+                        {AGE_OPTIONS.map(([v, l]) => <option key={v} value={v}>{l}</option>)}
+                      </select>
+                    </label>
+                  </>
+                ) : (
+                  <>
+                    <label className="f">Name<input autoFocus value={form.name} onChange={(e) => setForm({ ...form, name: e.target.value })} onKeyDown={(e) => e.key === "Enter" && addGames()} /></label>
+                    <div className="two">
+                      <label className="f">Condition
+                        <select value={form.condition} onChange={(e) => setForm({ ...form, condition: e.target.value })}>
+                          {CONDITIONS.map((c) => <option key={c}>{c}</option>)}
+                        </select>
+                      </label>
+                      <label className="f">Owned since<input type="date" value={form.ownedSince} onChange={(e) => setForm({ ...form, ownedSince: e.target.value })} /></label>
+                    </div>
+                  </>
+                )}
+                <div className="bar" style={{ margin: 0 }}>
+                  <button className="btn" onClick={addGames}>Add to shelf</button>
+                  <button className="btn ghost" onClick={() => setAdding(false)}>Cancel</button>
+                </div>
+              </div>
+            ) : scanning ? (
+              <Scanner games={owned} onClose={() => setScanning(false)} onAdd={addFromScan} onOpen={openGame} logPlay={logPlay} onLink={linkScan} />
+            ) : (
+              <>
+                <div className="bar">
+                  <button className="btn felt" style={{ flex: 1 }} onClick={() => setScanning(true)}>Scan barcode</button>
+                  <button className="btn" style={{ flex: 1 }} onClick={() => setAdding(true)}>Add by name</button>
+                </div>
+                <div className="bar">
+                  <input placeholder="Search your games" value={q} onChange={(e) => setQ(e.target.value)} aria-label="Search games" />
+                  <select value={sort} onChange={(e) => setSort(e.target.value)} style={{ width: "auto" }} aria-label="Sort">
+                    <option value="name">A–Z</option>
+                    <option value="idle">Most idle</option>
+                  </select>
+                </div>
+              </>
+            )}
+
+            {owned.length === 0 ? (
+              <div className="empty">Your shelf is empty. Scan a box, or tap Add by name and paste a list to load your whole collection at once.</div>
+            ) : (
+              <div className="list">{shelf.map((g) => renderCard(g))}</div>
+            )}
+
+            <p className="credit">Barcode matches from <a href="https://gameupc.com" target="_blank" rel="noreferrer">GameUPC</a>. Game links go to <a href="https://boardgamegeek.com" target="_blank" rel="noreferrer">BoardGameGeek</a>. Everything is saved on this device only.</p>
+
+            <details>
+              <summary>Backup and restore</summary>
+              <p>Copy this text somewhere safe, like a note. Paste it back here to restore. Box art isn't included, to keep the backup small.</p>
+              <textarea readOnly value={JSON.stringify(data)} onFocus={(e) => e.target.select()} />
+              <textarea style={{ marginTop: 8 }} placeholder="Paste a backup here" value={importText} onChange={(e) => setImportText(e.target.value)} />
+              <button className="btn ghost" style={{ marginTop: 8 }} onClick={() => {
+                try {
+                  const d = JSON.parse(importText);
+                  if (!Array.isArray(d.games)) throw 0;
+                  setData({ dustMonths: 12, ...d, games: d.games.map(normalize) });
+                  setImportText(""); setToast("Backup restored");
+                } catch (e) { setMsg("That backup couldn't be read. Paste the full text exactly as copied."); }
+              }}>Restore backup</button>
+            </details>
+          </>
+        )}
+
+        {tab === "dust" && (
+          <>
+            <label className="f" style={{ marginBottom: 12 }}>Not played in
+              <select value={data.dustMonths} onChange={(e) => setData((d) => ({ ...d, dustMonths: Number(e.target.value) }))}>
+                {[3, 6, 12, 18, 24, 36].map((m) => <option key={m} value={m}>{m} months</option>)}
+              </select>
+            </label>
+
+            {newbies.length > 0 && (
+              <div className="sheet">
+                <p style={{ margin: 0 }}>
+                  {newbies.length} game{newbies.length === 1 ? " was" : "s were"} added recently with no plays logged, so {newbies.length === 1 ? "it doesn't" : "they don't"} count as unplayed yet. If you've had {newbies.length === 1 ? "it" : "them"} a while, when did you get {newbies.length === 1 ? "it" : "them"}?
+                </p>
+                <div className="bar" style={{ margin: 0 }}>
+                  <select value={fixAge} onChange={(e) => setFixAge(e.target.value)} aria-label="When you got them">
+                    {AGE_OPTIONS.filter(([v]) => v !== "0").map(([v, l]) => <option key={v} value={v}>{l}</option>)}
+                  </select>
+                  <button className="btn" onClick={() => backdate(newbies.map((g) => g.id), Number(fixAge))}>Apply</button>
+                </div>
+              </div>
+            )}
+
+            {dusty.length > 0 && (
+              <div className="totals">
+                <small>{priced.length} of {dusty.length} priced</small>
+                <div className="two">
+                  <div><small>Garage sale total</small><strong>${sum("garage")}</strong></div>
+                  <div><small>Marketplace total</small><strong>${sum("marketplace")}</strong></div>
+                </div>
+                <button className="btn" style={{ background: "var(--meeple)", color: "var(--ink)", justifySelf: "start" }} disabled={!priced.length} onClick={copyListing}>Copy Marketplace listing</button>
+              </div>
+            )}
+            {copyText && <textarea readOnly value={copyText} onFocus={(e) => e.target.select()} style={{ marginBottom: 12 }} />}
+
+            {dusty.length === 0 ? (
+              <div className="empty">Everything's been played in the last {data.dustMonths} months. Try a shorter window to find sale candidates.</div>
+            ) : (
+              <div className="list">{dusty.map((g) => renderCard(g, true))}</div>
+            )}
+            <p className="hint" style={{ marginTop: 12 }}>
+              Mark a game as a keeper to hide it here, or tap Played if it made it back to the table.
+            </p>
+
+            {sold.length > 0 && (
+              <>
+                <h2>Sold: {sold.length} game{sold.length === 1 ? "" : "s"} for ${soldTotal}</h2>
+                <ul className="plays">
+                  {sold.map((g) => (
+                    <li key={g.id}>
+                      <span>{g.name}, ${g.soldFor}</span>
+                      <button className="x" onClick={() => upd(g.id, (x) => ({ ...x, status: "owned" }))}>Undo</button>
+                    </li>
+                  ))}
+                </ul>
+              </>
+            )}
+          </>
+        )}
+
+        {toast && <div className="toast" role="status">{toast}</div>}
+      </div>
+    </div>
+  );
+}
+
+
+ReactDOM.createRoot(document.getElementById("root")).render(<App />);
+</script>
+</body>
+</html>
