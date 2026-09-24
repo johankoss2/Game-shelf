@@ -91,6 +91,8 @@ const parseBgg = (url) => {
 const ebaySold = (name) => `https://www.ebay.com/sch/i.html?_nkw=${enc(name + " board game")}&LH_Sold=1&LH_Complete=1`;
 const fbSearch = (name) => `https://www.facebook.com/marketplace/search/?query=${enc(name + " board game")}`;
 const webSearch = (q) => `https://www.google.com/search?q=${enc(q)}`;
+const fullName = (g) => (g.edition ? `${g.name} ${g.edition}` : g.name);
+const EDITIONS = ["1st edition", "2nd edition", "3rd edition", "Revised edition", "Anniversary edition", "Big box", "Deluxe edition", "Collector's edition"];
 const bggViaGoogle = (name) => webSearch(`"${name}" board game site:boardgamegeek.com/boardgame`);
 
 // Rule of thumb from an eBay sold price (eBay buyers also pay shipping; local buyers expect a deal)
@@ -446,11 +448,11 @@ function Scanner({ games, onClose, onAdd, onOpen, logPlay, onLink }) {
         setStage("choose");
       } else {
         setSearchTerms(data.searched_for || "");
-        setNote("The barcode database doesn't know this one yet.");
+        setNote(`The barcode database doesn't know ${c} yet. Search by name below, or type the name yourself.`);
         setStage("choose");
       }
     } catch (e) {
-      setNote("Couldn't reach the barcode database right now, so name it yourself.");
+      setNote(`Couldn't reach the barcode database (${e.message}), so name it yourself.`);
       setStage("manual");
     }
   };
@@ -605,17 +607,24 @@ function Detail({ g, upd, logPlay, remove, artApi, checkTitle, checking }) {
 
   return (
     <div className="detail">
-      <label className="f">Title
-        <input value={g.name} onChange={(e) => upd(g.id, (x) => ({ ...x, name: e.target.value }))} />
-      </label>
+      <div className="two">
+        <label className="f">Title
+          <input value={g.name} onChange={(e) => upd(g.id, (x) => ({ ...x, name: e.target.value }))} />
+        </label>
+        <label className="f">Edition
+          <input list="edition-list" value={g.edition || ""} placeholder="Optional" onChange={(e) => upd(g.id, (x) => ({ ...x, edition: e.target.value }))} />
+          <datalist id="edition-list">{EDITIONS.map((v) => <option key={v} value={v} />)}</datalist>
+        </label>
+      </div>
 
       <div>
         <label className="f">BoardGameGeek</label>
         {g.bgg?.id ? (
           <div className="bar" style={{ margin: "6px 0 0" }}>
             <a className="btn ghost" href={bggUrl(g.bgg)} target="_blank" rel="noreferrer">Open on BGG</a>
-            <button className="x" onClick={() => upd(g.id, (x) => ({ ...x, bgg: undefined }))}>Unlink</button>
+            <button className="x" onClick={() => upd(g.id, (x) => ({ ...x, bgg: undefined, bggNone: true }))}>Unlink</button>
           </div>
+          <p className="hint">Own a different edition with its own BGG page? Tap Unlink, then search for it and paste that page's link.</p>
         ) : (
           <>
             {g.review ? <p className="hint">A title match is waiting for you at the top of the shelf.</p>
@@ -627,7 +636,7 @@ function Detail({ g, upd, logPlay, remove, artApi, checkTitle, checking }) {
               <input value={bggQuery} onChange={(e) => setBggQuery(e.target.value)} autoCorrect="off" />
             </label>
             <div className="bar" style={{ margin: "8px 0 0", flexWrap: "wrap" }}>
-              <a className="btn ghost" href={bggSearch(bggQuery.trim() || g.name)} target="_blank" rel="noreferrer">Search BGG</a>
+              <a className="btn ghost" href={bggSearch(bggQuery.trim() || fullName(g))} target="_blank" rel="noreferrer">Search BGG</a>
               <a className="btn ghost" href={bggViaGoogle(bggQuery.trim() || g.name)} target="_blank" rel="noreferrer">Search with Google</a>
             </div>
             <div className="bar" style={{ margin: "8px 0 0" }}>
@@ -659,8 +668,8 @@ function Detail({ g, upd, logPlay, remove, artApi, checkTitle, checking }) {
       <div>
         <label className="f">Prices</label>
         <div className="bar" style={{ margin: "6px 0 10px", flexWrap: "wrap" }}>
-          <a className="btn ghost" href={ebaySold(g.name)} target="_blank" rel="noreferrer">eBay sold prices</a>
-          <a className="btn ghost" href={fbSearch(g.name)} target="_blank" rel="noreferrer">Marketplace listings</a>
+          <a className="btn ghost" href={ebaySold(fullName(g))} target="_blank" rel="noreferrer">eBay sold prices</a>
+          <a className="btn ghost" href={fbSearch(fullName(g))} target="_blank" rel="noreferrer">Marketplace listings</a>
         </div>
         <div className="three">
           <label className="f">eBay sold
@@ -1021,7 +1030,7 @@ function App() {
   const soldTotal = sold.reduce((s, g) => s + (g.soldFor || 0), 0);
 
   const copyListing = async () => {
-    const lines = priced.map((g) => `${g.name}, ${g.condition.toLowerCase()}: $${g.prices.marketplace || g.prices.garage}`);
+    const lines = priced.map((g) => `${g.name}${g.edition ? ` (${g.edition})` : ""}, ${g.condition.toLowerCase()}: $${g.prices.marketplace || g.prices.garage}`);
     const text = `Board games for sale. Pickup only, cash or Venmo. Message me with questions.\n\n${lines.join("\n")}`;
     try { await navigator.clipboard.writeText(text); setToast("Listing copied"); setCopyText(""); }
     catch (e) { setCopyText(text); }
@@ -1042,7 +1051,7 @@ function App() {
         <div className="body">
           <div className="row">
             <button className="name" aria-expanded={isOpen} onClick={() => setOpen(isOpen ? null : g.id)}>
-              <b>{g.name}{g.bgg?.year ? <small> ({g.bgg.year})</small> : null}</b>
+              <b>{g.name}{g.edition ? <small> ({g.edition})</small> : g.bgg?.year ? <small> ({g.bgg.year})</small> : null}</b>
               <span>{idleLabel(g)}{sale ? `, ${g.condition.toLowerCase()}` : ""}</span>
             </button>
             <button className={`played ${justPlayed === g.id ? "done" : ""}`} onClick={() => logPlay(g)}>
@@ -1092,7 +1101,7 @@ function App() {
                     <div className="review" key={g.id}>
                       <p>You entered <b>{g.name}</b></p>
                       {[g.review.match, ...(g.review.alternatives || [])].filter(Boolean).map((m, i) => (
-                        <button className="pick" key={i} onClick={() => { upd(g.id, (x) => confirmMatch(x, m)); setToast(`Confirmed ${m.name}`); }}>
+                        <button className="pick" key={i} onClick={() => { upd(g.id, (x) => confirmMatch(x, m)); setToast(`Confirmed ${m.name}. Set the edition if it matters.`); openGame(g.id); }}>
                           <span><b>{m.name}</b>{m.year ? ` (${m.year})` : ""}</span>
                           <em>{i === 0 ? "Best match" : "Also possible"}</em>
                         </button>
