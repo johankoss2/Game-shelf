@@ -91,6 +91,7 @@ const parseBgg = (url) => {
 const ebaySold = (name) => `https://www.ebay.com/sch/i.html?_nkw=${enc(name + " board game")}&LH_Sold=1&LH_Complete=1`;
 const fbSearch = (name) => `https://www.facebook.com/marketplace/search/?query=${enc(name + " board game")}`;
 const webSearch = (q) => `https://www.google.com/search?q=${enc(q)}`;
+const bggViaGoogle = (name) => webSearch(`"${name}" board game site:boardgamegeek.com/boardgame`);
 
 // Rule of thumb from an eBay sold price (eBay buyers also pay shipping; local buyers expect a deal)
 const suggestFrom = (ebay) => ({ garage: Math.max(1, Math.round(ebay * 0.4)), marketplace: Math.max(1, Math.round(ebay * 0.65)) });
@@ -103,9 +104,36 @@ const normalize = (g) => {
     n.prices = { garage: mid(n.estimate.garage), marketplace: mid(n.estimate.marketplace) };
   }
   if (n.bgg && n.bgg.id && !n.bgg.slug) n.bgg = { id: String(n.bgg.id), slug: "" };
-  delete n.estimate; delete n.review; delete n.bggNone;
+  delete n.estimate;
   return n;
 };
+
+// ---------- Title check via Wikidata (free, no key) ----------
+// Finds games whose Wikidata entry lists a BoardGameGeek ID (property P2339)
+async function wikidataBgg(name) {
+  const q = `SELECT ?item ?itemLabel ?bgg (MIN(YEAR(?date)) AS ?year) ?num WHERE {
+    SERVICE wikibase:mwapi {
+      bd:serviceParam wikibase:endpoint "www.wikidata.org";
+                      wikibase:api "EntitySearch";
+                      mwapi:search ${JSON.stringify(name)};
+                      mwapi:language "en";
+                      mwapi:limit "25".
+      ?item wikibase:apiOutputItem mwapi:item.
+      ?num wikibase:apiOrdinal true.
+    }
+    ?item wdt:P2339 ?bgg.
+    OPTIONAL { ?item wdt:P577 ?date. }
+    SERVICE wikibase:label { bd:serviceParam wikibase:language "en". }
+  } GROUP BY ?item ?itemLabel ?bgg ?num ORDER BY ?num LIMIT 8`;
+  const r = await fetch(`https://query.wikidata.org/sparql?format=json&query=${enc(q)}`, { headers: { Accept: "application/sparql-results+json" } });
+  if (!r.ok) throw new Error(`Wikidata ${r.status}`);
+  const data = await r.json();
+  const seen = new Set();
+  return (data.results?.bindings || [])
+    .map((b) => ({ name: b.itemLabel?.value, bggId: b.bgg?.value, year: b.year?.value ? Number(b.year.value) : null }))
+    .filter((x) => x.name && x.bggId && /^\d+$/.test(x.bggId) && !seen.has(x.bggId) && seen.add(x.bggId));
+}
+const confirmMatch = (g, m) => ({ ...g, name: m.name, bgg: { id: String(m.bggId), slug: "", year: m.year || null }, review: undefined, bggNone: false });
 
 // ---------- Sync through a private GitHub repo ----------
 const b64encode = (str) => {
@@ -322,6 +350,12 @@ label.f{display:grid;gap:4px;font-size:13.5px;color:var(--muted);font-weight:600
 .totals .two strong{font-family:'Bricolage Grotesque',sans-serif;font-size:26px;display:block}
 .totals small{opacity:.75}
 .pick{display:flex;align-items:center;gap:10px;background:var(--paper);border:1.5px solid var(--line);border-radius:8px;padding:10px;font-size:16px}
+.review{background:var(--card);border:2px solid var(--meeple);border-radius:10px;padding:12px;display:grid;gap:8px}
+.review p{margin:0}
+button.pick{text-align:left;color:var(--ink);cursor:pointer;width:100%;font-family:inherit}
+.pick span{flex:1}
+.pick em{font-style:normal;font-size:12.5px;color:var(--muted);white-space:nowrap}
+.name b small{font-weight:400;color:var(--muted);font-size:14px}
 .msg{background:#FFF4D6;border-left:4px solid var(--meeple);padding:10px 12px;border-radius:6px;margin-bottom:12px;font-size:15px}
 .empty{text-align:center;padding:36px 16px;color:var(--muted)}
 .sheet{background:var(--card);border:2px solid var(--ink);border-radius:12px;padding:14px;display:grid;gap:10px;margin-bottom:14px}
@@ -553,11 +587,12 @@ function Scanner({ games, onClose, onAdd, onOpen, logPlay, onLink }) {
   );
 }
 
-function Detail({ g, upd, logPlay, remove, artApi }) {
+function Detail({ g, upd, logPlay, remove, artApi, checkTitle, checking }) {
   const [pastDate, setPastDate] = useState(today());
   const [soldFor, setSoldFor] = useState("");
   const [bggLink, setBggLink] = useState("");
   const [imgLink, setImgLink] = useState("");
+  const [bggQuery, setBggQuery] = useState(g.name);
   const plays = [...g.plays].sort((a, b) => b.date.localeCompare(a.date));
   const { hasArt, broken, setPhoto, setArtUrl, clearArt } = artApi;
   const p = g.prices || {};
@@ -579,8 +614,18 @@ function Detail({ g, upd, logPlay, remove, artApi }) {
           </div>
         ) : (
           <>
-            <p className="hint">Find the game on BGG, copy the page link, and paste it here. After that it's one tap.</p>
-            <a className="btn ghost" href={bggSearch(g.name)} target="_blank" rel="noreferrer">Find on BGG</a>
+            {g.review ? <p className="hint">A title match is waiting for you at the top of the shelf.</p>
+              : g.bggNone ? <p className="hint">The title database didn't find this one. Fix the title above and check again, or search for it yourself below.</p>
+              : null}
+            <button className="btn ghost" style={{ marginBottom: 10 }} disabled={checking} onClick={() => checkTitle([g])}>{checking ? "Checking…" : "Check title"}</button>
+            <p className="hint">Or search for the game, open its BGG page, copy the link, and paste it below.</p>
+            <label className="f">Search for
+              <input value={bggQuery} onChange={(e) => setBggQuery(e.target.value)} autoCorrect="off" />
+            </label>
+            <div className="bar" style={{ margin: "8px 0 0", flexWrap: "wrap" }}>
+              <a className="btn ghost" href={bggSearch(bggQuery.trim() || g.name)} target="_blank" rel="noreferrer">Search BGG</a>
+              <a className="btn ghost" href={bggViaGoogle(bggQuery.trim() || g.name)} target="_blank" rel="noreferrer">Search with Google</a>
+            </div>
             <div className="bar" style={{ margin: "8px 0 0" }}>
               <input placeholder="Paste BGG page link" value={bggLink} onChange={(e) => setBggLink(e.target.value.trim())} aria-label="BGG page link" />
               <button className="btn ghost" disabled={!parseBgg(bggLink)} onClick={() => { upd(g.id, (x) => ({ ...x, bgg: parseBgg(bggLink) })); setBggLink(""); }}>Save</button>
@@ -700,6 +745,7 @@ function App() {
   const [copyText, setCopyText] = useState("");
   const [importText, setImportText] = useState("");
   const [justPlayed, setJustPlayed] = useState(null);
+  const [checking, setChecking] = useState(false);
   const [syncCfg, setSyncCfg] = useState(null);
   const [sync, setSync] = useState({ state: "off" });
   const [repoDraft, setRepoDraft] = useState("");
@@ -874,6 +920,38 @@ function App() {
     : sync.at ? `Shared shelf: synced ${sinceLabel(sync.at)}.`
     : "Shared shelf: connected.";
 
+  // ---------- Title checks ----------
+  const checkTitles = async (list) => {
+    if (!list.length) return;
+    setChecking(true);
+    let auto = 0, toReview = 0, none = 0, failed = 0;
+    for (let i = 0; i < list.length; i++) {
+      const g = list[i];
+      if (list.length > 1) setMsg(`Checking titles… ${i + 1} of ${list.length}`);
+      try {
+        const results = await wikidataBgg(g.name);
+        const exact = results.find((r) => norm(r.name) === norm(g.name));
+        // If a different edition of the same game exists, ask instead of guessing
+        const editionTwin = exact && results.some((r) => r !== exact && norm(r.name).startsWith(norm(g.name)) && /edition|revised|deluxe|anniversary|big box/i.test(r.name));
+        if (exact && !editionTwin) {
+          auto++;
+          upd(g.id, (x) => confirmMatch(x, exact));
+        } else if (results.length) {
+          toReview++;
+          const ordered = exact ? [exact, ...results.filter((r) => r !== exact)] : results;
+          upd(g.id, (x) => ({ ...x, review: { match: ordered[0], alternatives: ordered.slice(1, 4) }, bggNone: false }));
+        } else {
+          none++;
+          upd(g.id, (x) => ({ ...x, review: undefined, bggNone: true }));
+        }
+      } catch (e) { failed++; }
+    }
+    setMsg(failed ? `Couldn't reach the title database for ${failed} game${failed === 1 ? "" : "s"}. Tap Check titles to try again.` : "");
+    const parts = [auto && `${auto} confirmed`, toReview && `${toReview} to review`, none && `${none} not found`].filter(Boolean);
+    if (parts.length) setToast(`Title check: ${parts.join(", ")}`);
+    setChecking(false);
+  };
+
   const openGame = (id) => {
     setScanning(false); setTab("shelf"); setQ(""); setOpen(id);
     setTimeout(() => document.getElementById(`g-${id}`)?.scrollIntoView({ behavior: "smooth", block: "center" }), 120);
@@ -883,6 +961,8 @@ function App() {
   const owned = data.games.filter((g) => g.status !== "sold");
   const sold = data.games.filter((g) => g.status === "sold");
   const dusty = owned.filter((g) => !g.keep && idleDays(g) >= threshold).sort((a, b) => idleDays(b) - idleDays(a));
+  const reviews = owned.filter((g) => g.review);
+  const unchecked = owned.filter((g) => !g.bgg?.id && !g.review && !g.bggNone);
   const newbies = owned.filter((g) => !g.plays.length && daysSince(g.ownedSince) < 30);
   const shelf = useMemo(() => {
     const f = owned.filter((g) => g.name.toLowerCase().includes(q.toLowerCase()));
@@ -913,6 +993,7 @@ function App() {
     if (info.image) putArt(g.id, info.image);
     setToast(`Added ${info.name}`);
     openGame(g.id);
+    if (!info.bggId) checkTitles([g]);
   };
 
   const addGames = () => {
@@ -927,7 +1008,8 @@ function App() {
     setForm({ name: "", condition: "Good", ownedSince: today() });
     setBulkText("");
     setAdding(false);
-    setToast(`Added ${names.length} game${names.length === 1 ? "" : "s"}`);
+    setToast(`Added ${names.length} game${names.length === 1 ? "" : "s"}. Checking titles…`);
+    checkTitles(fresh);
   };
 
   const priced = dusty.filter((g) => g.prices && (g.prices.garage || g.prices.marketplace));
@@ -956,7 +1038,7 @@ function App() {
         <div className="body">
           <div className="row">
             <button className="name" aria-expanded={isOpen} onClick={() => setOpen(isOpen ? null : g.id)}>
-              <b>{g.name}</b>
+              <b>{g.name}{g.bgg?.year ? <small> ({g.bgg.year})</small> : null}</b>
               <span>{idleLabel(g)}{sale ? `, ${g.condition.toLowerCase()}` : ""}</span>
             </button>
             <button className={`played ${justPlayed === g.id ? "done" : ""}`} onClick={() => logPlay(g)}>
@@ -971,7 +1053,7 @@ function App() {
           ) : sale && !isOpen ? (
             <p className="note">No prices yet. Tap the name to check eBay and set them.</p>
           ) : null}
-          {isOpen && <Detail g={g} upd={upd} logPlay={logPlay} remove={remove} artApi={{ hasArt: !!art[g.id], broken: !!broken[g.id], setPhoto, setArtUrl, clearArt }} />}
+          {isOpen && <Detail g={g} upd={upd} logPlay={logPlay} remove={remove} artApi={{ hasArt: !!art[g.id], broken: !!broken[g.id], setPhoto, setArtUrl, clearArt }} checkTitle={checkTitles} checking={checking} />}
         </div>
       </div>
     );
@@ -998,6 +1080,26 @@ function App() {
 
         {tab === "shelf" && (
           <>
+            {reviews.length > 0 && (
+              <>
+                <h2>Confirm {reviews.length} title{reviews.length === 1 ? "" : "s"}</h2>
+                <div className="list" style={{ marginBottom: 18 }}>
+                  {reviews.map((g) => (
+                    <div className="review" key={g.id}>
+                      <p>You entered <b>{g.name}</b></p>
+                      {[g.review.match, ...(g.review.alternatives || [])].filter(Boolean).map((m, i) => (
+                        <button className="pick" key={i} onClick={() => { upd(g.id, (x) => confirmMatch(x, m)); setToast(`Confirmed ${m.name}`); }}>
+                          <span><b>{m.name}</b>{m.year ? ` (${m.year})` : ""}</span>
+                          <em>{i === 0 ? "Best match" : "Also possible"}</em>
+                        </button>
+                      ))}
+                      <button className="x" style={{ justifySelf: "start", padding: 0 }} onClick={() => upd(g.id, (x) => ({ ...x, review: undefined, bggNone: true }))}>None of these, keep my title</button>
+                    </div>
+                  ))}
+                </div>
+              </>
+            )}
+
             {adding ? (
               <div className="sheet">
                 <div className="bar" style={{ margin: 0 }}>
@@ -1051,13 +1153,19 @@ function App() {
               </>
             )}
 
+            {unchecked.length > 0 && !adding && !scanning && (
+              <button className="btn ghost" style={{ width: "100%", marginBottom: 10 }} disabled={checking} onClick={() => checkTitles(unchecked)}>
+                {checking ? "Checking titles…" : `Check ${unchecked.length} title${unchecked.length === 1 ? "" : "s"}`}
+              </button>
+            )}
+
             {owned.length === 0 ? (
               <div className="empty">Your shelf is empty. Scan a box, or tap Add by name and paste a list to load your whole collection at once.</div>
             ) : (
               <div className="list">{shelf.map((g) => renderCard(g))}</div>
             )}
 
-            <p className="credit">Barcode matches from <a href="https://gameupc.com" target="_blank" rel="noreferrer">GameUPC</a>. Game links go to <a href="https://boardgamegeek.com" target="_blank" rel="noreferrer">BoardGameGeek</a>. Everything is saved on this device only.</p>
+            <p className="credit">Title checks from <a href="https://www.wikidata.org" target="_blank" rel="noreferrer">Wikidata</a>. Barcode matches from <a href="https://gameupc.com" target="_blank" rel="noreferrer">GameUPC</a>. Game links go to <a href="https://boardgamegeek.com" target="_blank" rel="noreferrer">BoardGameGeek</a>. Everything is saved on this device only.</p>
 
             <details>
               <summary>Backup and restore</summary>
