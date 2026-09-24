@@ -109,29 +109,33 @@ const normalize = (g) => {
 };
 
 // ---------- Title check via Wikidata (free, no key) ----------
-// Finds games whose Wikidata entry lists a BoardGameGeek ID (property P2339)
+// Finds games whose Wikidata entry lists a BoardGameGeek ID (property P2339).
+// Uses Wikidata's standard web API, which allows calls from any web page.
+const WD = "https://www.wikidata.org/w/api.php";
 async function wikidataBgg(name) {
-  const q = `SELECT ?item ?itemLabel ?bgg (MIN(YEAR(?date)) AS ?year) ?num WHERE {
-    SERVICE wikibase:mwapi {
-      bd:serviceParam wikibase:endpoint "www.wikidata.org";
-                      wikibase:api "EntitySearch";
-                      mwapi:search ${JSON.stringify(name)};
-                      mwapi:language "en";
-                      mwapi:limit "25".
-      ?item wikibase:apiOutputItem mwapi:item.
-      ?num wikibase:apiOrdinal true.
-    }
-    ?item wdt:P2339 ?bgg.
-    OPTIONAL { ?item wdt:P577 ?date. }
-    SERVICE wikibase:label { bd:serviceParam wikibase:language "en". }
-  } GROUP BY ?item ?itemLabel ?bgg ?num ORDER BY ?num LIMIT 8`;
-  const r = await fetch(`https://query.wikidata.org/sparql?format=json&query=${enc(q)}`, { headers: { Accept: "application/sparql-results+json" } });
-  if (!r.ok) throw new Error(`Wikidata ${r.status}`);
-  const data = await r.json();
+  const s = await fetch(`${WD}?action=wbsearchentities&format=json&origin=*&language=en&uselang=en&type=item&limit=20&search=${enc(name)}`);
+  if (!s.ok) throw new Error(`search ${s.status}`);
+  const sd = await s.json();
+  const hits = sd.search || [];
+  if (!hits.length) return [];
+  const ids = hits.map((h) => h.id);
+  const e = await fetch(`${WD}?action=wbgetentities&format=json&origin=*&languages=en&props=${enc("labels|claims")}&ids=${enc(ids.join("|"))}`);
+  if (!e.ok) throw new Error(`details ${e.status}`);
+  const ed = await e.json();
+  const val = (ent, p) => ent.claims?.[p]?.[0]?.mainsnak?.datavalue?.value;
   const seen = new Set();
-  return (data.results?.bindings || [])
-    .map((b) => ({ name: b.itemLabel?.value, bggId: b.bgg?.value, year: b.year?.value ? Number(b.year.value) : null }))
-    .filter((x) => x.name && x.bggId && /^\d+$/.test(x.bggId) && !seen.has(x.bggId) && seen.add(x.bggId));
+  return ids
+    .map((id) => ed.entities?.[id])
+    .filter(Boolean)
+    .map((ent) => {
+      const bgg = val(ent, "P2339");
+      const t = val(ent, "P577");
+      const year = t && typeof t.time === "string" ? Number(t.time.slice(1, 5)) || null : null;
+      const label = ent.labels?.en?.value || hits.find((h) => h.id === ent.id)?.label;
+      return { name: label, bggId: typeof bgg === "string" ? bgg : null, year };
+    })
+    .filter((x) => x.name && x.bggId && /^\d+$/.test(x.bggId) && !seen.has(x.bggId) && seen.add(x.bggId))
+    .slice(0, 8);
 }
 const confirmMatch = (g, m) => ({ ...g, name: m.name, bgg: { id: String(m.bggId), slug: "", year: m.year || null }, review: undefined, bggNone: false });
 
@@ -924,7 +928,7 @@ function App() {
   const checkTitles = async (list) => {
     if (!list.length) return;
     setChecking(true);
-    let auto = 0, toReview = 0, none = 0, failed = 0;
+    let auto = 0, toReview = 0, none = 0, failed = 0, lastErr = "";
     for (let i = 0; i < list.length; i++) {
       const g = list[i];
       if (list.length > 1) setMsg(`Checking titles… ${i + 1} of ${list.length}`);
@@ -944,9 +948,9 @@ function App() {
           none++;
           upd(g.id, (x) => ({ ...x, review: undefined, bggNone: true }));
         }
-      } catch (e) { failed++; }
+      } catch (e) { failed++; lastErr = e.message; }
     }
-    setMsg(failed ? `Couldn't reach the title database for ${failed} game${failed === 1 ? "" : "s"}. Tap Check titles to try again.` : "");
+    setMsg(failed ? `Couldn't reach the title database for ${failed} game${failed === 1 ? "" : "s"}. Tap Check title to try again. (${lastErr})` : "");
     const parts = [auto && `${auto} confirmed`, toReview && `${toReview} to review`, none && `${none} not found`].filter(Boolean);
     if (parts.length) setToast(`Title check: ${parts.join(", ")}`);
     setChecking(false);
