@@ -47,6 +47,12 @@
   if (navigator.storage && navigator.storage.persist) navigator.storage.persist();
 })();
 </script>
+<script>
+window.addEventListener("error", function (e) {
+  var b = document.getElementById("boot");
+  if (b) b.textContent = "The app couldn't start: " + (e.message || "unknown error") + ". Send a screenshot of this to get it fixed.";
+});
+</script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.28.4/babel.min.js"></script>
@@ -620,11 +626,13 @@ function Detail({ g, upd, logPlay, remove, artApi, checkTitle, checking }) {
       <div>
         <label className="f">BoardGameGeek</label>
         {g.bgg?.id ? (
+          <>
           <div className="bar" style={{ margin: "6px 0 0" }}>
             <a className="btn ghost" href={bggUrl(g.bgg)} target="_blank" rel="noreferrer">Open on BGG</a>
             <button className="x" onClick={() => upd(g.id, (x) => ({ ...x, bgg: undefined, bggNone: true }))}>Unlink</button>
           </div>
           <p className="hint">Own a different edition with its own BGG page? Tap Unlink, then search for it and paste that page's link.</p>
+          </>
         ) : (
           <>
             {g.review ? <p className="hint">A title match is waiting for you at the top of the shelf.</p>
