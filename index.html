@@ -58,11 +58,11 @@ window.addEventListener("error", function (e) {
 <script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.28.4/babel.min.js"></script>
 </head>
 <body>
-<div id="root"><p id="boot">Loading your shelf… (version 1.2)</p></div>
+<div id="root"><p id="boot">Loading your shelf… (version 1.4)</p></div>
 <script type="text/babel" data-presets="react">
 const { useState, useEffect, useMemo, useRef } = React;
 
-const APP_VERSION = "1.2";
+const APP_VERSION = "1.4";
 const KEY = "boardgame-shelf-v1";
 const ART_KEY = "boardgame-art-v1";
 const SYNC_KEY = "boardgame-sync-v1";
@@ -103,7 +103,7 @@ const webSearch = (q) => `https://www.google.com/search?q=${enc(q)}`;
 const fullName = (g) => (g.edition ? `${g.name} ${g.edition}` : g.name);
 const PRIORITIES = ["Must have", "Want", "Maybe"];
 const shopSearch = (name) => `https://www.google.com/search?tbm=shop&q=${enc(name + " board game")}`;
-const wishLine = (g) => [g.priority || "Want", g.msrp ? `MSRP $${g.msrp}` : null, g.maxPrice ? `would pay up to $${g.maxPrice}` : null].filter(Boolean).join(", ");
+const wishLine = (g) => [g.priority || "Want", g.msrp ? `MSRP $${g.msrp}` : null, g.market?.low ? `new from $${g.market.low}` : null, g.maxPrice ? `would pay up to $${g.maxPrice}` : null].filter(Boolean).join(", ");
 const msrpSearch = (name) => webSearch(`${name} board game MSRP`);
 // Compares a store price to MSRP and the price limit, e.g. "25% off MSRP, within your limit"
 const priceVerdict = (g, price) => {
@@ -120,12 +120,41 @@ const EDITIONS = ["1st edition", "2nd edition", "3rd edition", "Revised edition"
 const bggViaGoogle = (name) => webSearch(`"${name}" board game site:boardgamegeek.com/boardgame`);
 
 // Rule of thumb from an eBay sold price (eBay buyers also pay shipping; local buyers expect a deal)
-// Rule of thumb from MSRP and condition (Marketplace share of MSRP; garage sale about 60% of that)
-const MSRP_FACTOR = { "Sealed": 0.7, "Like new": 0.55, "Good": 0.45, "Well-loved": 0.3 };
-const suggestFromMsrp = (msrp, cond) => {
-  const f = MSRP_FACTOR[cond] ?? 0.45;
-  return { marketplace: Math.max(1, Math.round(msrp * f)), garage: Math.max(1, Math.round(msrp * f * 0.6)) };
+// Used-price rule of thumb as a share of the original price, by condition
+const RATES = {
+  "Sealed": { garage: 0.45, marketplace: 0.8 },
+  "Like new": { garage: 0.35, marketplace: 0.65 },
+  "Good": { garage: 0.25, marketplace: 0.5 },
+  "Well-loved": { garage: 0.15, marketplace: 0.35 },
 };
+const rateFor = (cond) => RATES[cond] || RATES.Good;
+const estimateFrom = (base, cond) => {
+  const r = rateFor(cond);
+  return { garage: Math.max(1, Math.round(base * r.garage)), marketplace: Math.max(1, Math.round(base * r.marketplace)) };
+};
+// Original price: MSRP if entered, otherwise the new price captured when the game went on the shelf
+const basePrice = (g) => g.msrp || g.market?.low || null;
+const autoPrices = (g) => { const b = basePrice(g); return b ? { ...(g.prices || {}), ...estimateFrom(b, g.condition), manual: false } : g.prices; };
+// BoardGamePrices.com public API: current offers by BGG ID. Their terms: link back, cache at least an hour.
+async function fetchBgp(eids) {
+  const site = enc(location.origin + location.pathname);
+  const r = await fetch(`https://boardgameprices.com/api/info?eid=${eids.join(",")}&currency=USD&destination=US&sort=CHEAP1&preferred_language=GB&sitename=${site}`);
+  if (!r.ok) throw new Error(`prices ${r.status}`);
+  const d = await r.json();
+  const out = {};
+  (d.items || []).forEach((it) => {
+    const eid = String(it.external_id || "");
+    if (!eid || out[eid]) return; // first item is the preferred (English) version
+    const offers = (it.prices || []).filter((p) => Number(p.price) > 0);
+    const inStock = offers.filter((p) => p.stock === "Y");
+    const pool = inStock.length ? inStock : offers;
+    if (!pool.length) { out[eid] = { none: true, url: it.url || null, at: Date.now() }; return; }
+    const totals = pool.map((p) => Number(p.price)).sort((a, b) => a - b);
+    out[eid] = { low: Math.round(totals[0]), offers: pool.length, inStock: inStock.length > 0, url: it.url || null, at: Date.now() };
+  });
+  eids.forEach((e) => { if (!out[e]) out[e] = { none: true, at: Date.now() }; });
+  return out;
+}
 const suggestFrom = (ebay) => ({ garage: Math.max(1, Math.round(ebay * 0.4)), marketplace: Math.max(1, Math.round(ebay * 0.65)) });
 
 // Older data (from the Claude version) used AI estimate ranges; convert to single prices
@@ -264,7 +293,7 @@ const readSetupCode = (code) => {
 const sinceLabel = (t) => {
   if (!t) return "";
   const s = Math.round((Date.now() - t) / 1000);
-  return s < 60 ? "just now" : s < 3600 ? `${Math.round(s / 60)} min ago` : `${Math.round(s / 3600)} hr ago`;
+  return s < 60 ? "just now" : s < 3600 ? `${Math.round(s / 60)} min ago` : s < 86400 ? `${Math.round(s / 3600)} hr ago` : `${Math.round(s / 86400)} days ago`;
 };
 
 // ---------- Images ----------
@@ -799,7 +828,7 @@ function Scanner({ games, wishes, onClose, onAdd, onAddWish, onBought, onOpen, l
   );
 }
 
-function Detail({ g, upd, logPlay, remove, artApi, checkTitle, checking, onBought, openSelling, locations = [] }) {
+function Detail({ g, upd, logPlay, remove, artApi, checkTitle, checking, onBought, openSelling, locations = [], priceCheck, pricing }) {
   const isWish = g.status === "wish";
   const linked = !!g.bgg?.id;
   const [pastDate, setPastDate] = useState(today());
@@ -811,9 +840,11 @@ function Detail({ g, upd, logPlay, remove, artApi, checkTitle, checking, onBough
   const plays = [...g.plays].sort((a, b) => b.date.localeCompare(a.date));
   const { hasArt, broken, setPhoto, setArtUrl, clearArt } = artApi;
   const p = g.prices || {};
-  const setPrice = (k, v) => upd(g.id, (x) => ({ ...x, prices: { ...(x.prices || {}), [k]: v === "" ? null : Number(v) } }));
+  const setPrice = (k, v) => upd(g.id, (x) => ({ ...x, prices: { ...(x.prices || {}), [k]: v === "" ? null : Number(v), manual: k !== "ebay" ? true : !!(x.prices || {}).manual } }));
+  const fresh = g.market?.at && Date.now() - g.market.at < 3600000;
   const sugg = p.ebay ? suggestFrom(p.ebay) : null;
-  const msrpSugg = g.msrp ? suggestFromMsrp(g.msrp, g.condition) : null;
+  const base = basePrice(g);
+  const est = base ? estimateFrom(base, g.condition) : null;
   const money = (v) => v.replace(/[^0-9.]/g, "");
 
   // ---- pieces ----
@@ -925,7 +956,7 @@ function Detail({ g, upd, logPlay, remove, artApi, checkTitle, checking, onBough
       </label>
       <div className="two">
         <label className="f">Condition
-          <select value={g.condition} onChange={(e) => upd(g.id, (x) => ({ ...x, condition: e.target.value }))}>
+          <select value={g.condition} onChange={(e) => { const c = e.target.value; upd(g.id, (x) => { const n = { ...x, condition: c }; return (x.prices || {}).manual || isWish ? n : { ...n, prices: autoPrices(n) }; }); }}>
             {CONDITIONS.map((c) => <option key={c}>{c}</option>)}
           </select>
         </label>
@@ -950,20 +981,8 @@ function Detail({ g, upd, logPlay, remove, artApi, checkTitle, checking, onBough
 
   const sellingBody = (
     <div style={{ display: "grid", gap: 16 }}>
-      <div>
-        <label className="f">MSRP
-          <div className="bar" style={{ margin: 0 }}>
-            <input inputMode="decimal" placeholder="$" value={g.msrp ?? ""} onChange={(e) => { const v = money(e.target.value); upd(g.id, (x) => ({ ...x, msrp: v === "" ? null : Number(v) })); }} />
-            <a className="btn ghost" href={msrpSearch(fullName(g))} target="_blank" rel="noreferrer">Look up MSRP</a>
-          </div>
-        </label>
-        {msrpSugg && (msrpSugg.garage !== p.garage || msrpSugg.marketplace !== p.marketplace) && (
-          <button className="btn ghost" style={{ marginTop: 8 }} onClick={() => upd(g.id, (x) => ({ ...x, prices: { ...(x.prices || {}), ...msrpSugg } }))}>
-            Estimate from MSRP: ${msrpSugg.garage} garage, ${msrpSugg.marketplace} Marketplace
-          </button>
-        )}
-        <p className="hint" style={{ marginBottom: 0 }}>Estimates use the game's condition ({g.condition.toLowerCase()}): Marketplace at about {Math.round((MSRP_FACTOR[g.condition] ?? 0.45) * 100)}% of MSRP, garage sale a bit lower. An eBay sold price below is a better guide when you have one.</p>
-      </div>
+      {marketBox}
+      {estimateBox}
       <div>
         <div className="bar" style={{ margin: "0 0 10px", flexWrap: "wrap" }}>
           <a className="btn ghost" href={ebaySold(fullName(g))} target="_blank" rel="noreferrer">eBay sold prices</a>
@@ -981,7 +1000,7 @@ function Detail({ g, upd, logPlay, remove, artApi, checkTitle, checking, onBough
           </label>
         </div>
         {sugg && (sugg.garage !== p.garage || sugg.marketplace !== p.marketplace) && (
-          <button className="btn ghost" style={{ marginTop: 8 }} onClick={() => upd(g.id, (x) => ({ ...x, prices: { ...x.prices, ...sugg } }))}>
+          <button className="btn ghost" style={{ marginTop: 8 }} onClick={() => upd(g.id, (x) => ({ ...x, prices: { ...x.prices, ...sugg, manual: true } }))}>
             Estimate from eBay: ${sugg.garage} garage, ${sugg.marketplace} Marketplace
           </button>
         )}
@@ -999,6 +1018,7 @@ function Detail({ g, upd, logPlay, remove, artApi, checkTitle, checking, onBough
 
   const wishFields = (
     <>
+      {marketBox}
       <div className="two">
         <label className="f">Priority
           <select value={g.priority || "Want"} onChange={(e) => upd(g.id, (x) => ({ ...x, priority: e.target.value }))}>
@@ -1027,6 +1047,50 @@ function Detail({ g, upd, logPlay, remove, artApi, checkTitle, checking, onBough
       </div>
       <button className="btn felt" style={{ justifySelf: "start" }} onClick={() => onBought(g)}>We bought it, move to shelf</button>
     </>
+  );
+
+  const marketBox = (
+    <div>
+      <label className="f">{isWish ? "Current new price" : "New price when added"}</label>
+      {g.market?.low ? (
+        <p style={{ margin: "4px 0 0" }}><b>${g.market.low}</b> <span style={{ color: "var(--muted)", fontSize: 13.5 }}>lowest of {g.market.offers} offer{g.market.offers === 1 ? "" : "s"}{g.market.inStock ? "" : " (none in stock)"}, {new Date(g.market.at).toLocaleDateString(undefined, { month: "short", day: "numeric", year: "numeric" })}</span></p>
+      ) : g.market?.none ? (
+        <p className="hint">No offers found for this game. Enter an MSRP below to estimate from that.</p>
+      ) : g.bgg?.id ? (
+        <p className="hint">{pricing ? "Checking…" : "Not checked yet."}</p>
+      ) : (
+        <p className="hint">Link this game to BGG and its new price is captured automatically.</p>
+      )}
+      {g.bgg?.id && (
+        <div className="bar" style={{ margin: "6px 0 0", flexWrap: "wrap" }}>
+          <button className="btn ghost" disabled={pricing || fresh} onClick={() => priceCheck([g], true)}>{pricing ? "Checking…" : fresh ? "Checked recently" : "Update price"}</button>
+          {g.market?.url && <a className="btn ghost" href={g.market.url} target="_blank" rel="noreferrer">See offers</a>}
+        </div>
+      )}
+      <p className="hint" style={{ marginBottom: 0 }}>From <a href={g.market?.url || "https://boardgameprices.com"} target="_blank" rel="noreferrer">BoardGamePrices.com</a>.{isWish ? "" : " Stored with the game; only changes if you tap Update price."}</p>
+    </div>
+  );
+
+  const estimateBox = !isWish && (
+    <div>
+      <label className="f">MSRP (optional)
+        <div className="bar" style={{ margin: 0 }}>
+          <input inputMode="decimal" placeholder="$" value={g.msrp ?? ""} onChange={(e) => { const v = money(e.target.value); upd(g.id, (x) => { const n = { ...x, msrp: v === "" ? null : Number(v) }; return (x.prices || {}).manual ? n : { ...n, prices: autoPrices(n) }; }); }} />
+          <a className="btn ghost" href={msrpSearch(fullName(g))} target="_blank" rel="noreferrer">Look up MSRP</a>
+        </div>
+      </label>
+      {est ? (
+        <p style={{ margin: "8px 0 0" }}>
+          <b>Estimate for {g.condition.toLowerCase()} condition:</b> garage sale ${est.garage} ({Math.round(rateFor(g.condition).garage * 100)}%), Marketplace ${est.marketplace} ({Math.round(rateFor(g.condition).marketplace * 100)}%) of ${base} {g.msrp ? "MSRP" : "new price"}.
+        </p>
+      ) : (
+        <p className="hint" style={{ marginBottom: 0 }}>Enter an MSRP, or link the game to BGG, to get an estimate.</p>
+      )}
+      {est && p.manual && (est.garage !== p.garage || est.marketplace !== p.marketplace) ? (
+        <button className="btn ghost" style={{ marginTop: 8 }} onClick={() => upd(g.id, (x) => ({ ...x, prices: autoPrices(x) }))}>Use the estimate</button>
+      ) : null}
+      <p className="hint" style={{ marginBottom: 0 }}>Your prices below fill in from the estimate until you type your own. MSRP takes priority over the new price when both are set.</p>
+    </div>
   );
 
   const deleteBtn = (
@@ -1098,6 +1162,9 @@ function App() {
   const [wishPriority, setWishPriority] = useState("Want");
   const [wishText, setWishText] = useState("");
   const [locFilter, setLocFilter] = useState("");
+  const [pricing, setPricing] = useState(false);
+  const pricingRef = useRef(false);
+  const priceTried = useRef(new Set());
   const [syncCfg, setSyncCfg] = useState(null);
   const [sync, setSync] = useState({ state: "off" });
   const [repoDraft, setRepoDraft] = useState("");
@@ -1272,6 +1339,46 @@ function App() {
     : sync.at ? `Shared shelf: synced ${sinceLabel(sync.at)}.`
     : "Shared shelf: connected.";
 
+  // ---------- Price checks (BoardGamePrices.com) ----------
+  const priceCheck = async (list, force = false) => {
+    const games = list.filter((g) => g.bgg?.id && (force ? !(g.market?.at && Date.now() - g.market.at < 3600000) : !g.market));
+    games.forEach((g) => priceTried.current.add(g.id));
+    if (!games.length || pricingRef.current) return;
+    pricingRef.current = true;
+    setPricing(true);
+    try {
+      const ids = [...new Set(games.map((g) => String(g.bgg.id)))];
+      const results = {};
+      for (let i = 0; i < ids.length; i += 20) Object.assign(results, await fetchBgp(ids.slice(i, i + 20)));
+      const want = new Set(games.map((g) => g.id));
+      setData((d) => ({
+        ...d,
+        games: d.games.map((g) => {
+          if (!want.has(g.id)) return g;
+          const m = results[String(g.bgg?.id)];
+          if (!m) return g;
+          const next = { ...g, market: m, updatedAt: Date.now() };
+          if ((g.status || "owned") === "owned" && !(g.prices || {}).manual) next.prices = autoPrices(next);
+          return next;
+        }),
+      }));
+      if (force) setToast(games.length === 1 ? "Price updated" : `Prices updated for ${games.length} games`);
+    } catch (e) {
+      setMsg(`Couldn't check prices right now (${e.message}). Try Refresh price again later.`);
+    }
+    pricingRef.current = false;
+    setPricing(false);
+  };
+
+  // New games linked to BGG get their price checked automatically
+  useEffect(() => {
+    if (!loaded) return;
+    const todo = data.games.filter((g) => ["owned", "wish", undefined].includes(g.status) && g.bgg?.id && !g.market && !priceTried.current.has(g.id));
+    if (!todo.length) return;
+    const t = setTimeout(() => priceCheck(todo), 1500);
+    return () => clearTimeout(t);
+  }, [data, loaded]);
+
   // ---------- Title checks ----------
   const checkTitles = async (list) => {
     if (!list.length) return;
@@ -1384,7 +1491,8 @@ function App() {
     if (!info.bggId) checkTitles([g]);
   };
   const bought = (g) => {
-    upd(g.id, (x) => ({ ...x, status: "owned", ownedSince: today(), boughtOn: today(), addedAt: today(), review: undefined }));
+    priceTried.current.delete(g.id);
+    upd(g.id, (x) => ({ ...x, status: "owned", ownedSince: today(), boughtOn: today(), addedAt: today(), review: undefined, market: undefined }));
     setToast(`${g.name} moved to your shelf. Enjoy!`);
     openGame(g.id, "shelf");
   };
@@ -1461,7 +1569,7 @@ function App() {
           ) : sale && !isOpen ? (
             <p className="note">No prices yet. Tap the name to check eBay and set them.</p>
           ) : null}
-          {isOpen && <Detail g={g} upd={upd} logPlay={logPlay} remove={remove} artApi={{ hasArt: !!art[g.id], broken: !!broken[g.id], setPhoto, setArtUrl, clearArt }} checkTitle={checkTitles} checking={checking} onBought={bought} openSelling={sale} locations={locations} />}
+          {isOpen && <Detail g={g} upd={upd} logPlay={logPlay} remove={remove} artApi={{ hasArt: !!art[g.id], broken: !!broken[g.id], setPhoto, setArtUrl, clearArt }} checkTitle={checkTitles} checking={checking} onBought={bought} openSelling={sale} locations={locations} priceCheck={priceCheck} pricing={pricing} />}
         </div>
       </div>
     );
@@ -1593,7 +1701,7 @@ function App() {
               <div className="list">{shelf.map((g) => renderCard(g))}</div>
             )}
 
-            <p className="credit">Title checks from <a href="https://www.wikidata.org" target="_blank" rel="noreferrer">Wikidata</a>. Barcode matches from <a href="https://gameupc.com" target="_blank" rel="noreferrer">GameUPC</a>. Game links go to <a href="https://boardgamegeek.com" target="_blank" rel="noreferrer">BoardGameGeek</a>. Saved on this phone, and synced if Shared shelf is on.<br />Game Shelf version {APP_VERSION}</p>
+            <p className="credit">Title checks from <a href="https://www.wikidata.org" target="_blank" rel="noreferrer">Wikidata</a>. Barcode matches from <a href="https://gameupc.com" target="_blank" rel="noreferrer">GameUPC</a>. New prices from <a href="https://boardgameprices.com" target="_blank" rel="noreferrer">BoardGamePrices.com</a>. Game links go to <a href="https://boardgamegeek.com" target="_blank" rel="noreferrer">BoardGameGeek</a>. Saved on this phone, and synced if Shared shelf is on.<br />Game Shelf version {APP_VERSION}</p>
 
             <details>
               <summary>Backup and restore</summary>
@@ -1687,7 +1795,10 @@ function App() {
                   <div><small>Garage sale total</small><strong>${sum("garage")}</strong></div>
                   <div><small>Marketplace total</small><strong>${sum("marketplace")}</strong></div>
                 </div>
-                <button className="btn" style={{ background: "var(--meeple)", color: "var(--ink)", justifySelf: "start" }} disabled={!priced.length} onClick={copyListing}>Copy Marketplace listing</button>
+                <div className="bar" style={{ margin: 0, flexWrap: "wrap" }}>
+                  <button className="btn" style={{ background: "var(--meeple)", color: "var(--ink)" }} disabled={!priced.length} onClick={copyListing}>Copy Marketplace listing</button>
+                  <button className="btn" style={{ background: "transparent", border: "1.5px solid var(--paper)" }} disabled={pricing} onClick={() => priceCheck(forSale, true)}>{pricing ? "Checking…" : "Refresh prices"}</button>
+                </div>
               </div>
             )}
             {copyText && <textarea readOnly value={copyText} onFocus={(e) => e.target.select()} style={{ marginBottom: 12 }} />}
