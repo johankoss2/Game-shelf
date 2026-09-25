@@ -58,10 +58,11 @@ window.addEventListener("error", function (e) {
 <script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.28.4/babel.min.js"></script>
 </head>
 <body>
-<div id="root"><p id="boot">Loading your shelf…</p></div>
+<div id="root"><p id="boot">Loading your shelf… (version 1.0)</p></div>
 <script type="text/babel" data-presets="react">
 const { useState, useEffect, useMemo, useRef } = React;
 
+const APP_VERSION = "1.0";
 const KEY = "boardgame-shelf-v1";
 const ART_KEY = "boardgame-art-v1";
 const SYNC_KEY = "boardgame-sync-v1";
@@ -456,6 +457,8 @@ details.more{margin:0;color:var(--ink);font-size:15px;border:1.5px solid var(--l
 details.more summary{font-weight:700;cursor:pointer}
 details.more summary small{font-weight:400;color:var(--muted)}
 details.more[open] summary{margin-bottom:10px}
+details.more details.more{background:var(--card)}
+.sellbox{border:2px solid var(--meeple);border-radius:8px;padding:10px 12px}
 .loc{display:inline-block;background:var(--paper);border:1px solid var(--line);border-radius:999px;padding:0 8px;font-size:12.5px;color:var(--ink);margin-left:6px;line-height:1.6}
 .chips{display:flex;gap:6px;flex-wrap:wrap;margin:-4px 0 12px}
 .chip{border:1.5px solid var(--line);background:transparent;border-radius:999px;padding:5px 12px;font:600 13.5px Figtree,sans-serif;color:var(--ink)}
@@ -792,6 +795,7 @@ function Scanner({ games, wishes, onClose, onAdd, onAddWish, onBought, onOpen, l
 
 function Detail({ g, upd, logPlay, remove, artApi, checkTitle, checking, onBought, openSelling, locations = [] }) {
   const isWish = g.status === "wish";
+  const linked = !!g.bgg?.id;
   const [pastDate, setPastDate] = useState(today());
   const [soldFor, setSoldFor] = useState("");
   const [bggLink, setBggLink] = useState("");
@@ -803,109 +807,111 @@ function Detail({ g, upd, logPlay, remove, artApi, checkTitle, checking, onBough
   const p = g.prices || {};
   const setPrice = (k, v) => upd(g.id, (x) => ({ ...x, prices: { ...(x.prices || {}), [k]: v === "" ? null : Number(v) } }));
   const sugg = p.ebay ? suggestFrom(p.ebay) : null;
+  const money = (v) => v.replace(/[^0-9.]/g, "");
 
-  return (
-    <div className="detail">
-      <div className="two">
-        <label className="f">Title
-          <input value={g.name} onChange={(e) => upd(g.id, (x) => ({ ...x, name: e.target.value }))} />
-        </label>
-        <label className="f">Edition
-          <input list="edition-list" value={g.edition || ""} placeholder="Optional" onChange={(e) => upd(g.id, (x) => ({ ...x, edition: e.target.value }))} />
-          <datalist id="edition-list">{EDITIONS.map((v) => <option key={v} value={v} />)}</datalist>
-        </label>
+  // ---- pieces ----
+  const bggButtons = (
+    <>
+      <div className="bar" style={{ margin: 0, flexWrap: "wrap" }}>
+        <a className="btn ghost" href={bggUrl(g.bgg || {}, g.name)} target="_blank" rel="noreferrer">Open on BGG</a>
+        <button className="btn ghost" onClick={async () => {
+          const link = bggUrl(g.bgg, g.name);
+          try { await navigator.clipboard.writeText(link); setCopied("yes"); } catch (e) { setCopied(link); }
+          setTimeout(() => setCopied(""), 2500);
+        }}>{copied === "yes" ? "Copied!" : "Copy link"}</button>
       </div>
+      {copied && copied !== "yes" && <input readOnly value={copied} onFocus={(e) => e.target.select()} aria-label="BGG link" />}
+    </>
+  );
 
-      <div>
-        <label className="f">BoardGameGeek</label>
-        {g.bgg?.id ? (
-          <>
-          <div className="bar" style={{ margin: "6px 0 0", flexWrap: "wrap" }}>
-            <a className="btn ghost" href={bggUrl(g.bgg, g.name)} target="_blank" rel="noreferrer">Open on BGG</a>
-            <button className="btn ghost" onClick={async () => {
-              const link = bggUrl(g.bgg, g.name);
-              try { await navigator.clipboard.writeText(link); setCopied("yes"); } catch (e) { setCopied(link); }
-              setTimeout(() => setCopied(""), 2500);
-            }}>{copied === "yes" ? "Copied!" : "Copy link"}</button>
-            <button className="x" onClick={() => upd(g.id, (x) => ({ ...x, bgg: undefined, bggNone: true }))}>Unlink</button>
-          </div>
-          {copied && copied !== "yes" && <input readOnly value={copied} onFocus={(e) => e.target.select()} style={{ marginTop: 8 }} aria-label="BGG link" />}
-          <p className="hint">Own a different edition with its own BGG page? Tap Unlink, then search for it and paste that page's link.</p>
-          </>
-        ) : (
-          <>
-            {g.review ? <p className="hint">A title match is waiting for you at the top of the shelf.</p>
-              : g.bggNone ? <p className="hint">The title database didn't find this one. Fix the title above and check again, or search for it yourself below.</p>
-              : null}
-            <button className="btn ghost" style={{ marginBottom: 10 }} disabled={checking} onClick={() => checkTitle([g])}>{checking ? "Checking…" : "Check title"}</button>
-            <p className="hint">Or search for the game, open its BGG page, copy the link, and paste it below.</p>
-            <label className="f">Search for
-              <input value={bggQuery} onChange={(e) => setBggQuery(e.target.value)} autoCorrect="off" />
-            </label>
-            <div className="bar" style={{ margin: "8px 0 0", flexWrap: "wrap" }}>
-              <a className="btn ghost" href={bggSearch(bggQuery.trim() || fullName(g))} target="_blank" rel="noreferrer">Search BGG</a>
-              <a className="btn ghost" href={bggViaGoogle(bggQuery.trim() || g.name)} target="_blank" rel="noreferrer">Search with Google</a>
-            </div>
-            <div className="bar" style={{ margin: "8px 0 0" }}>
-              <input placeholder="Paste BGG page link" value={bggLink} onChange={(e) => setBggLink(e.target.value.trim())} aria-label="BGG page link" />
-              <button className="btn ghost" disabled={!parseBgg(bggLink)} onClick={() => { upd(g.id, (x) => ({ ...x, bgg: parseBgg(bggLink) })); setBggLink(""); }}>Save</button>
-            </div>
-            {bggLink && !parseBgg(bggLink) && <p className="hint" style={{ color: "var(--tag)" }}>That doesn't look like a BGG game page link.</p>}
-          </>
-        )}
+  const identify = (
+    <div>
+      <label className="f">Match to BoardGameGeek</label>
+      {g.review ? <p className="hint">A title match is waiting for you at the top of the list.</p>
+        : g.bggNone ? <p className="hint">The title database didn't find this one. Fix the title under Edit details and check again, or search for it below.</p>
+        : null}
+      <button className="btn ghost" style={{ margin: "6px 0 10px" }} disabled={checking} onClick={() => checkTitle([g])}>{checking ? "Checking…" : "Check title"}</button>
+      <label className="f">Or search for
+        <input value={bggQuery} onChange={(e) => setBggQuery(e.target.value)} autoCorrect="off" />
+      </label>
+      <div className="bar" style={{ margin: "8px 0 0", flexWrap: "wrap" }}>
+        <a className="btn ghost" href={bggSearch(bggQuery.trim() || fullName(g))} target="_blank" rel="noreferrer">Search BGG</a>
+        <a className="btn ghost" href={bggViaGoogle(bggQuery.trim() || g.name)} target="_blank" rel="noreferrer">Search with Google</a>
       </div>
+      <div className="bar" style={{ margin: "8px 0 0" }}>
+        <input placeholder="Paste BGG page link" value={bggLink} onChange={(e) => setBggLink(e.target.value.trim())} aria-label="BGG page link" />
+        <button className="btn ghost" disabled={!parseBgg(bggLink)} onClick={() => { upd(g.id, (x) => ({ ...x, bgg: parseBgg(bggLink), bggNone: false, review: undefined })); setBggLink(""); }}>Save</button>
+      </div>
+      {bggLink && !parseBgg(bggLink) && <p className="hint" style={{ color: "var(--tag)" }}>That doesn't look like a BGG game page link.</p>}
+    </div>
+  );
 
-      <details className="more">
-        <summary>Box art <small>{hasArt ? (broken ? "(link not loading)" : "(set)") : "(none yet)"}</small></summary>
-        <div className="bar" style={{ margin: "6px 0 0", flexWrap: "wrap" }}>
-          <label className="btn ghost filebtn">
-            {hasArt ? "Replace with photo" : "Take a photo"}
-            <input type="file" accept="image/*" hidden onChange={(e) => { const f = e.target.files[0]; e.target.value = ""; f && setPhoto(g, f); }} />
-          </label>
-          {hasArt && <button className="x" onClick={() => clearArt(g.id)}>Remove art</button>}
-        </div>
-        {broken && <p className="hint" style={{ color: "var(--tag)" }}>That image link won't load. Try a photo or a different link.</p>}
-        <div className="bar" style={{ margin: "8px 0 0" }}>
-          <input placeholder="Or paste an image link" value={imgLink} onChange={(e) => setImgLink(e.target.value.trim())} aria-label="Image link" />
-          <button className="btn ghost" disabled={!/^https:\/\//.test(imgLink)} onClick={() => { setArtUrl(g.id, imgLink); setImgLink(""); }}>Save</button>
-        </div>
-        <p className="hint">On the BGG page, long-press the box image, choose Open in New Tab, then copy that tab's address.</p>
-      </details>
+  const titleEdition = (
+    <div className="two">
+      <label className="f">Title
+        <input value={g.name} onChange={(e) => upd(g.id, (x) => ({ ...x, name: e.target.value }))} />
+      </label>
+      <label className="f">Edition
+        <input list="edition-list" value={g.edition || ""} placeholder="Optional" onChange={(e) => upd(g.id, (x) => ({ ...x, edition: e.target.value }))} />
+        <datalist id="edition-list">{EDITIONS.map((v) => <option key={v} value={v} />)}</datalist>
+      </label>
+    </div>
+  );
 
-      {isWish && (
-        <>
-          <div className="two">
-            <label className="f">Priority
-              <select value={g.priority || "Want"} onChange={(e) => upd(g.id, (x) => ({ ...x, priority: e.target.value }))}>
-                {PRIORITIES.map((v) => <option key={v}>{v}</option>)}
-              </select>
-            </label>
-            <label className="f">Would pay up to
-              <input inputMode="decimal" placeholder="$" value={g.maxPrice ?? ""} onChange={(e) => { const v = e.target.value.replace(/[^0-9.]/g, ""); upd(g.id, (x) => ({ ...x, maxPrice: v === "" ? null : Number(v) })); }} />
-            </label>
-          </div>
-          <div>
-            <label className="f">MSRP
-              <div className="bar" style={{ margin: 0 }}>
-                <input inputMode="decimal" placeholder="$" value={g.msrp ?? ""} onChange={(e) => { const v = e.target.value.replace(/[^0-9.]/g, ""); upd(g.id, (x) => ({ ...x, msrp: v === "" ? null : Number(v) })); }} />
-                <a className="btn ghost" href={msrpSearch(fullName(g))} target="_blank" rel="noreferrer">Look up MSRP</a>
-              </div>
-            </label>
-            {g.msrp && g.maxPrice ? <p className="hint" style={{ marginBottom: 0 }}>Your limit is {Math.round((1 - g.maxPrice / g.msrp) * 100)}% off MSRP.</p> : null}
-          </div>
-          <label className="f">Notes
-            <input value={g.note || ""} placeholder="Who wants it, why, where you saw it" onChange={(e) => upd(g.id, (x) => ({ ...x, note: e.target.value }))} />
-          </label>
-          <div className="bar" style={{ margin: 0, flexWrap: "wrap" }}>
-            <a className="btn ghost" href={shopSearch(fullName(g))} target="_blank" rel="noreferrer">Compare new prices</a>
-            <a className="btn ghost" href={ebaySold(fullName(g))} target="_blank" rel="noreferrer">eBay sold (used)</a>
-          </div>
-          <button className="btn felt" style={{ justifySelf: "start" }} onClick={() => onBought(g)}>We bought it, move to shelf</button>
-        </>
-      )}
+  const unlinkRow = linked && (
+    <div>
+      <button className="x" style={{ padding: 0 }} onClick={() => upd(g.id, (x) => ({ ...x, bgg: undefined, bggNone: true }))}>Unlink from BGG</button>
+      <p className="hint" style={{ marginBottom: 0 }}>Own a different edition with its own BGG page? Unlink, then search for it and paste that page's link.</p>
+    </div>
+  );
 
-      {!isWish && (
-      <>
+  const artSection = (
+    <details className="more">
+      <summary>Box art <small>{hasArt ? (broken ? "(link not loading)" : "(set)") : "(none yet)"}</small></summary>
+      <div className="bar" style={{ margin: "6px 0 0", flexWrap: "wrap" }}>
+        <label className="btn ghost filebtn">
+          {hasArt ? "Replace with photo" : "Take a photo"}
+          <input type="file" accept="image/*" hidden onChange={(e) => { const f = e.target.files[0]; e.target.value = ""; f && setPhoto(g, f); }} />
+        </label>
+        {hasArt && <button className="x" onClick={() => clearArt(g.id)}>Remove art</button>}
+      </div>
+      {broken && <p className="hint" style={{ color: "var(--tag)" }}>That image link won't load. Try a photo or a different link.</p>}
+      <div className="bar" style={{ margin: "8px 0 0" }}>
+        <input placeholder="Or paste an image link" value={imgLink} onChange={(e) => setImgLink(e.target.value.trim())} aria-label="Image link" />
+        <button className="btn ghost" disabled={!/^https:\/\//.test(imgLink)} onClick={() => { setArtUrl(g.id, imgLink); setImgLink(""); }}>Save</button>
+      </div>
+      <p className="hint" style={{ marginBottom: 0 }}>On the BGG page, long-press the box image, choose Open in New Tab, then copy that tab's address.</p>
+    </details>
+  );
+
+  const logRow = (
+    <div>
+      <label className="f">Log a play</label>
+      <div className="bar" style={{ margin: "4px 0 0" }}>
+        <input type="date" value={pastDate} max={today()} onChange={(e) => setPastDate(e.target.value)} aria-label="Play date" />
+        <button className="btn felt" onClick={() => pastDate && logPlay(g, pastDate)}>Log play</button>
+      </div>
+      <p className="hint" style={{ marginBottom: 0 }}>{g.plays.length} play{g.plays.length === 1 ? "" : "s"} logged</p>
+    </div>
+  );
+
+  const playHistory = plays.length > 0 && (
+    <div>
+      <label className="f">Play history</label>
+      <ul className="plays" style={{ marginTop: 4 }}>
+        {plays.slice(0, 8).map((pl) => (
+          <li key={pl.id}>
+            {new Date(pl.date + "T12:00:00").toLocaleDateString(undefined, { month: "short", day: "numeric", year: "numeric" })}
+            <button className="x" onClick={() => upd(g.id, (x) => ({ ...x, plays: x.plays.filter((q) => q.id !== pl.id), deletedPlays: [...(x.deletedPlays || []), pl.id] }))}>Remove</button>
+          </li>
+        ))}
+        {plays.length > 8 && <li style={{ color: "var(--muted)" }}>and {plays.length - 8} earlier plays</li>}
+      </ul>
+    </div>
+  );
+
+  const ownedFields = (
+    <>
       <label className="f">Location
         <input list="loc-list" value={g.location || ""} placeholder="Where it lives, e.g. Basement shelf" onChange={(e) => upd(g.id, (x) => ({ ...x, location: e.target.value }))} />
         <datalist id="loc-list">{locations.map((l) => <option key={l} value={l} />)}</datalist>
@@ -924,45 +930,25 @@ function Detail({ g, upd, logPlay, remove, artApi, checkTitle, checking, onBough
         <input type="checkbox" checked={!!g.keep} onChange={(e) => upd(g.id, (x) => ({ ...x, keep: e.target.checked }))} />
         Keeper (never suggest selling this one)
       </label>
+    </>
+  );
 
+  const sellingBody = (
+    <div style={{ display: "grid", gap: 16 }}>
       <div>
-        <label className="f">Log a play on another date</label>
-        <div className="bar" style={{ marginTop: 4 }}>
-          <input type="date" value={pastDate} max={today()} onChange={(e) => setPastDate(e.target.value)} />
-          <button className="btn felt" onClick={() => pastDate && logPlay(g, pastDate)}>Log play</button>
-        </div>
-        {plays.length > 0 && (
-          <ul className="plays">
-            {plays.slice(0, 8).map((pl) => (
-              <li key={pl.id}>
-                {new Date(pl.date + "T12:00:00").toLocaleDateString(undefined, { month: "short", day: "numeric", year: "numeric" })}
-                <button className="x" onClick={() => upd(g.id, (x) => ({ ...x, plays: x.plays.filter((q) => q.id !== pl.id), deletedPlays: [...(x.deletedPlays || []), pl.id] }))}>Remove</button>
-              </li>
-            ))}
-            {plays.length > 8 && <li style={{ color: "var(--muted)" }}>and {plays.length - 8} earlier plays</li>}
-          </ul>
-        )}
-        <p className="hint" style={{ marginBottom: 0 }}>{g.plays.length} play{g.plays.length === 1 ? "" : "s"} logged</p>
-      </div>
-
-      <details className="more" open={!!openSelling}>
-        <summary>Selling <small>{g.prices && (g.prices.garage || g.prices.marketplace) ? `($${g.prices.marketplace || g.prices.garage} set)` : "(prices, mark sold)"}</small></summary>
-        <div style={{ display: "grid", gap: 16 }}>
-      <div>
-        <label className="f">Prices</label>
-        <div className="bar" style={{ margin: "6px 0 10px", flexWrap: "wrap" }}>
+        <div className="bar" style={{ margin: "0 0 10px", flexWrap: "wrap" }}>
           <a className="btn ghost" href={ebaySold(fullName(g))} target="_blank" rel="noreferrer">eBay sold prices</a>
           <a className="btn ghost" href={fbSearch(fullName(g))} target="_blank" rel="noreferrer">Marketplace listings</a>
         </div>
         <div className="three">
           <label className="f">eBay sold
-            <input inputMode="decimal" placeholder="$" value={p.ebay ?? ""} onChange={(e) => setPrice("ebay", e.target.value.replace(/[^0-9.]/g, ""))} />
+            <input inputMode="decimal" placeholder="$" value={p.ebay ?? ""} onChange={(e) => setPrice("ebay", money(e.target.value))} />
           </label>
           <label className="f">Garage sale
-            <input inputMode="decimal" placeholder="$" value={p.garage ?? ""} onChange={(e) => setPrice("garage", e.target.value.replace(/[^0-9.]/g, ""))} />
+            <input inputMode="decimal" placeholder="$" value={p.garage ?? ""} onChange={(e) => setPrice("garage", money(e.target.value))} />
           </label>
           <label className="f">Marketplace
-            <input inputMode="decimal" placeholder="$" value={p.marketplace ?? ""} onChange={(e) => setPrice("marketplace", e.target.value.replace(/[^0-9.]/g, ""))} />
+            <input inputMode="decimal" placeholder="$" value={p.marketplace ?? ""} onChange={(e) => setPrice("marketplace", money(e.target.value))} />
           </label>
         </div>
         {sugg && (sugg.garage !== p.garage || sugg.marketplace !== p.marketplace) && (
@@ -970,20 +956,88 @@ function Detail({ g, upd, logPlay, remove, artApi, checkTitle, checking, onBough
             Fill in ${sugg.garage} garage, ${sugg.marketplace} Marketplace
           </button>
         )}
-        <p className="hint">Look at a few recent eBay sales and enter a typical one. The fill-in button uses a rule of thumb: about 40% of eBay for a garage sale and 65% for Marketplace, since local buyers skip shipping and expect a deal. Adjust to taste.</p>
+        <p className="hint" style={{ marginBottom: 0 }}>Enter a typical recent eBay sale. The fill-in button uses a rule of thumb: about 40% of eBay for a garage sale and 65% for Marketplace. Adjust to taste.</p>
       </div>
       <div>
         <label className="f">Sold it? Record the price</label>
-        <div className="bar" style={{ marginTop: 4 }}>
-          <input inputMode="decimal" placeholder="$" value={soldFor} onChange={(e) => setSoldFor(e.target.value.replace(/[^0-9.]/g, ""))} />
+        <div className="bar" style={{ margin: "4px 0 0" }}>
+          <input inputMode="decimal" placeholder="$" value={soldFor} onChange={(e) => setSoldFor(money(e.target.value))} />
           <button className="btn tag" onClick={() => upd(g.id, (x) => ({ ...x, status: "sold", soldFor: Number(soldFor) || 0, soldOn: today() }))}>Mark sold</button>
         </div>
       </div>
+    </div>
+  );
+
+  const wishFields = (
+    <>
+      <div className="two">
+        <label className="f">Priority
+          <select value={g.priority || "Want"} onChange={(e) => upd(g.id, (x) => ({ ...x, priority: e.target.value }))}>
+            {PRIORITIES.map((v) => <option key={v}>{v}</option>)}
+          </select>
+        </label>
+        <label className="f">Would pay up to
+          <input inputMode="decimal" placeholder="$" value={g.maxPrice ?? ""} onChange={(e) => { const v = money(e.target.value); upd(g.id, (x) => ({ ...x, maxPrice: v === "" ? null : Number(v) })); }} />
+        </label>
+      </div>
+      <div>
+        <label className="f">MSRP
+          <div className="bar" style={{ margin: 0 }}>
+            <input inputMode="decimal" placeholder="$" value={g.msrp ?? ""} onChange={(e) => { const v = money(e.target.value); upd(g.id, (x) => ({ ...x, msrp: v === "" ? null : Number(v) })); }} />
+            <a className="btn ghost" href={msrpSearch(fullName(g))} target="_blank" rel="noreferrer">Look up MSRP</a>
+          </div>
+        </label>
+        {g.msrp && g.maxPrice ? <p className="hint" style={{ marginBottom: 0 }}>Your limit is {Math.round((1 - g.maxPrice / g.msrp) * 100)}% off MSRP.</p> : null}
+      </div>
+      <label className="f">Notes
+        <input value={g.note || ""} placeholder="Who wants it, why, where you saw it" onChange={(e) => upd(g.id, (x) => ({ ...x, note: e.target.value }))} />
+      </label>
+      <div className="bar" style={{ margin: 0, flexWrap: "wrap" }}>
+        <a className="btn ghost" href={shopSearch(fullName(g))} target="_blank" rel="noreferrer">Compare new prices</a>
+        <a className="btn ghost" href={ebaySold(fullName(g))} target="_blank" rel="noreferrer">eBay sold (used)</a>
+      </div>
+      <button className="btn felt" style={{ justifySelf: "start" }} onClick={() => onBought(g)}>We bought it, move to shelf</button>
+    </>
+  );
+
+  const deleteBtn = (
+    <button className="x" style={{ justifySelf: "start", padding: 0 }} onClick={() => remove(g)}>{isWish ? "Remove from wish list" : "Delete game from shelf"}</button>
+  );
+
+  // ---- layout ----
+  return (
+    <div className="detail">
+      {linked ? bggButtons : identify}
+
+      {isWish ? wishFields : (
+        <>
+          {logRow}
+          {openSelling && (
+            <div className="sellbox">
+              <label className="f" style={{ marginBottom: 8 }}>Selling</label>
+              {sellingBody}
+            </div>
+          )}
+        </>
+      )}
+
+      <details className="more">
+        <summary>Edit details <small>{isWish ? "(title, art)" : "(title, location, condition, art, plays)"}</small></summary>
+        <div style={{ display: "grid", gap: 14 }}>
+          {titleEdition}
+          {!isWish && ownedFields}
+          {artSection}
+          {!isWish && playHistory}
+          {!isWish && !openSelling && (
+            <details className="more">
+              <summary>Selling <small>{p.garage || p.marketplace ? `($${p.marketplace || p.garage} set)` : "(prices, mark sold)"}</small></summary>
+              {sellingBody}
+            </details>
+          )}
+          {unlinkRow}
+          {deleteBtn}
         </div>
       </details>
-      </>
-      )}
-      <button className="x" style={{ justifySelf: "start", padding: 0 }} onClick={() => remove(g)}>{isWish ? "Remove from wish list" : "Delete game from shelf"}</button>
     </div>
   );
 }
@@ -1409,7 +1463,7 @@ function App() {
     </>
   );
 
-  if (!loaded) return <div className="bg"><div className="app"><style>{css}</style><p className="sub">Loading your shelf…</p></div></div>;
+  if (!loaded) return <div className="bg"><div className="app"><style>{css}</style><p className="sub">Loading your shelf… (version {APP_VERSION})</p></div></div>;
 
   return (
     <div className="bg">
@@ -1506,7 +1560,7 @@ function App() {
               <div className="list">{shelf.map((g) => renderCard(g))}</div>
             )}
 
-            <p className="credit">Title checks from <a href="https://www.wikidata.org" target="_blank" rel="noreferrer">Wikidata</a>. Barcode matches from <a href="https://gameupc.com" target="_blank" rel="noreferrer">GameUPC</a>. Game links go to <a href="https://boardgamegeek.com" target="_blank" rel="noreferrer">BoardGameGeek</a>. Everything is saved on this device only.</p>
+            <p className="credit">Title checks from <a href="https://www.wikidata.org" target="_blank" rel="noreferrer">Wikidata</a>. Barcode matches from <a href="https://gameupc.com" target="_blank" rel="noreferrer">GameUPC</a>. Game links go to <a href="https://boardgamegeek.com" target="_blank" rel="noreferrer">BoardGameGeek</a>. Everything is saved on this device only.<br />Game Shelf version {APP_VERSION}</p>
 
             <details>
               <summary>Backup and restore</summary>
