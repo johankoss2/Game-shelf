@@ -58,11 +58,11 @@ window.addEventListener("error", function (e) {
 <script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.28.4/babel.min.js"></script>
 </head>
 <body>
-<div id="root"><p id="boot">Loading your shelf… (version 1.1)</p></div>
+<div id="root"><p id="boot">Loading your shelf… (version 1.2)</p></div>
 <script type="text/babel" data-presets="react">
 const { useState, useEffect, useMemo, useRef } = React;
 
-const APP_VERSION = "1.1";
+const APP_VERSION = "1.2";
 const KEY = "boardgame-shelf-v1";
 const ART_KEY = "boardgame-art-v1";
 const SYNC_KEY = "boardgame-sync-v1";
@@ -130,7 +130,7 @@ const suggestFrom = (ebay) => ({ garage: Math.max(1, Math.round(ebay * 0.4)), ma
 
 // Older data (from the Claude version) used AI estimate ranges; convert to single prices
 const normalize = (g) => {
-  const n = { plays: [], keep: false, status: "owned", condition: "Good", ownedSince: today(), ...g };
+  const n = { plays: [], keep: false, status: "owned", condition: "Good", ownedSince: today(), addedAt: today(), ...g };
   if (!n.prices && n.estimate) {
     const mid = (r) => (r ? Math.round((r[0] + r[1]) / 2) : null);
     n.prices = { garage: mid(n.estimate.garage), marketplace: mid(n.estimate.marketplace) };
@@ -407,8 +407,8 @@ h1{font-family:'Bricolage Grotesque',system-ui,sans-serif;font-weight:800;font-s
 h2{font-family:'Bricolage Grotesque',system-ui,sans-serif;font-weight:500;font-size:22px;margin:18px 0 8px}
 .sub{color:var(--muted);margin:0 0 18px}
 .hint{margin:4px 0 8px;color:var(--muted);font-size:13.5px}
-.tabs{display:flex;gap:6px;margin-bottom:14px}
-.tab{flex:1;padding:10px;border:2px solid var(--ink);background:transparent;border-radius:10px;font:600 15px Figtree,sans-serif;color:var(--ink)}
+.tabs{display:flex;gap:5px;margin-bottom:14px}
+.tab{flex:1;padding:8px 4px;border:2px solid var(--ink);background:transparent;border-radius:10px;font:600 14px Figtree,sans-serif;color:var(--ink);line-height:1.2}
 .tab[aria-selected=true]{background:var(--ink);color:var(--paper)}
 .bar{display:flex;gap:8px;margin-bottom:12px;align-items:center}
 input,select,textarea{font:inherit;font-size:16px;color:var(--ink);background:var(--card);border:1.5px solid var(--line);border-radius:8px;padding:9px 10px;width:100%;box-sizing:border-box}
@@ -937,10 +937,15 @@ function Detail({ g, upd, logPlay, remove, artApi, checkTitle, checking, onBough
   );
 
   const keeperBox = (
-    <label className="check">
-      <input type="checkbox" checked={!!g.keep} onChange={(e) => upd(g.id, (x) => ({ ...x, keep: e.target.checked }))} />
-      Keeper (never suggest selling this one)
-    </label>
+    <div className="bar" style={{ margin: 0, flexWrap: "wrap", justifyContent: "space-between" }}>
+      <label className="check">
+        <input type="checkbox" checked={!!g.keep} onChange={(e) => upd(g.id, (x) => ({ ...x, keep: e.target.checked, forSale: e.target.checked ? false : x.forSale }))} />
+        Keeper
+      </label>
+      <button className={`btn ${g.forSale ? "ghost" : "tag"}`} onClick={() => upd(g.id, (x) => ({ ...x, forSale: !x.forSale, keep: x.forSale ? x.keep : false }))}>
+        {g.forSale ? "Take off sale" : "Mark for sale"}
+      </button>
+    </div>
   );
 
   const sellingBody = (
@@ -1312,7 +1317,8 @@ function App() {
   const wishReviews = wishes.filter((g) => g.review);
   const locations = [...new Set(owned.map((g) => (g.location || "").trim()).filter(Boolean))].sort((a, b) => a.localeCompare(b));
   const sold = data.games.filter((g) => g.status === "sold");
-  const dusty = owned.filter((g) => !g.keep && idleDays(g) >= threshold).sort((a, b) => idleDays(b) - idleDays(a));
+  const forSale = owned.filter((g) => g.forSale).sort((a, b) => a.name.localeCompare(b.name));
+  const dusty = owned.filter((g) => !g.keep && !g.forSale && idleDays(g) >= threshold).sort((a, b) => idleDays(b) - idleDays(a));
   const reviews = owned.filter((g) => g.review);
   const unchecked = owned.filter((g) => !g.bgg?.id && !g.review && !g.bggNone);
   const newbies = owned.filter((g) => !g.plays.length && daysSince(g.ownedSince) < 30);
@@ -1341,7 +1347,7 @@ function App() {
       return;
     }
     const g = {
-      id: uid(), name: info.name, condition: "Good", ownedSince: yearsAgo(years), plays: [], keep: false, status: "owned", upc: code, updatedAt: Date.now(),
+      id: uid(), name: info.name, condition: "Good", ownedSince: yearsAgo(years), plays: [], keep: false, status: "owned", upc: code, updatedAt: Date.now(), addedAt: today(),
       ...(info.bggId ? { bgg: { id: info.bggId, slug: "" } } : {}),
     };
     setData((d) => ({ ...d, games: [...d.games, g] }));
@@ -1378,7 +1384,7 @@ function App() {
     if (!info.bggId) checkTitles([g]);
   };
   const bought = (g) => {
-    upd(g.id, (x) => ({ ...x, status: "owned", ownedSince: today(), boughtOn: today(), review: undefined }));
+    upd(g.id, (x) => ({ ...x, status: "owned", ownedSince: today(), boughtOn: today(), addedAt: today(), review: undefined }));
     setToast(`${g.name} moved to your shelf. Enjoy!`);
     openGame(g.id, "shelf");
   };
@@ -1397,7 +1403,7 @@ function App() {
     const fresh = names.map((name) => ({
       id: uid(), name, condition: bulk ? "Good" : form.condition,
       ownedSince: bulk ? yearsAgo(Number(bulkAge)) : form.ownedSince || today(),
-      plays: [], keep: false, status: "owned", updatedAt: Date.now(),
+      plays: [], keep: false, status: "owned", updatedAt: Date.now(), addedAt: today(),
     }));
     setData((d) => ({ ...d, games: [...d.games, ...fresh] }));
     setForm({ name: "", condition: "Good", ownedSince: today() });
@@ -1407,7 +1413,7 @@ function App() {
     checkTitles(fresh);
   };
 
-  const priced = dusty.filter((g) => g.prices && (g.prices.garage || g.prices.marketplace));
+  const priced = forSale.filter((g) => g.prices && (g.prices.garage || g.prices.marketplace));
   const sum = (k) => priced.reduce((s, g) => s + (g.prices[k] || 0), 0);
   const soldTotal = sold.reduce((s, g) => s + (g.soldFor || 0), 0);
 
@@ -1421,7 +1427,8 @@ function App() {
   const renderCard = (g, mode) => {
     const wish = mode === "wish";
     const sale = mode === true;
-    const level = wish ? 0 : Math.min(1, idleDays(g) / threshold);
+    // For sale: always gray. Otherwise stays in full color for a year after going on the shelf, then fades as it sits unplayed
+    const level = wish ? 0 : g.forSale ? 1 : daysSince(g.addedAt || today()) < 365 ? 0 : Math.min(1, idleDays(g) / threshold);
     const isOpen = open === g.id;
     const showArt = art[g.id] && !broken[g.id];
     const p = g.prices || {};
@@ -1436,7 +1443,7 @@ function App() {
           <div className="row">
             <button className="name" aria-expanded={isOpen} onClick={() => setOpen(isOpen ? null : g.id)}>
               <b>{g.name}{g.edition ? <small> ({g.edition})</small> : g.bgg?.year ? <small> ({g.bgg.year})</small> : null}</b>
-              <span>{wish ? wishLine(g) : idleLabel(g)}{sale ? `, ${g.condition.toLowerCase()}` : ""}{!wish && g.location ? <span className="loc">{g.location}</span> : null}</span>
+              <span>{wish ? wishLine(g) : idleLabel(g)}{sale ? `, ${g.condition.toLowerCase()}` : ""}{!wish && g.location ? <span className="loc">{g.location}</span> : null}{!wish && !sale && g.forSale ? <span className="loc" style={{ borderColor: "var(--tag)", color: "var(--tag)" }}>For sale</span> : null}</span>
             </button>
             {wish ? (
               <button className="played" onClick={() => bought(g)}>Bought it</button>
@@ -1503,6 +1510,7 @@ function App() {
         <div className="tabs" role="tablist">
           <button className="tab" role="tab" aria-selected={tab === "shelf"} onClick={() => { setTab("shelf"); setScanning(false); }}>Shelf</button>
           <button className="tab" role="tab" aria-selected={tab === "dust"} onClick={() => { setTab("dust"); setScanning(false); }}>Unplayed ({dusty.length})</button>
+          <button className="tab" role="tab" aria-selected={tab === "sale"} onClick={() => { setTab("sale"); setScanning(false); }}>For sale ({forSale.length})</button>
           <button className="tab" role="tab" aria-selected={tab === "wish"} onClick={() => { setTab("wish"); setScanning(false); }}>Wish list ({wishes.length})</button>
         </div>
 
@@ -1658,9 +1666,23 @@ function App() {
               </div>
             )}
 
-            {dusty.length > 0 && (
+            {dusty.length === 0 ? (
+              <div className="empty">Everything's been played in the last {data.dustMonths} months. Try a shorter window to find sale candidates.</div>
+            ) : (
+              <div className="list">{dusty.map((g) => renderCard(g))}</div>
+            )}
+            <p className="hint" style={{ marginTop: 12 }}>
+              Tap a game to mark it as a keeper, mark it for sale, or log a play if it made it back to the table.
+            </p>
+
+          </>
+        )}
+
+        {tab === "sale" && (
+          <>
+            {forSale.length > 0 && (
               <div className="totals">
-                <small>{priced.length} of {dusty.length} priced</small>
+                <small>{priced.length} of {forSale.length} priced</small>
                 <div className="two">
                   <div><small>Garage sale total</small><strong>${sum("garage")}</strong></div>
                   <div><small>Marketplace total</small><strong>${sum("marketplace")}</strong></div>
@@ -1670,15 +1692,11 @@ function App() {
             )}
             {copyText && <textarea readOnly value={copyText} onFocus={(e) => e.target.select()} style={{ marginBottom: 12 }} />}
 
-            {dusty.length === 0 ? (
-              <div className="empty">Everything's been played in the last {data.dustMonths} months. Try a shorter window to find sale candidates.</div>
+            {forSale.length === 0 ? (
+              <div className="empty">Nothing marked for sale. Open a game and tap Mark for sale. The Unplayed tab is a good place to find candidates.</div>
             ) : (
-              <div className="list">{dusty.map((g) => renderCard(g, true))}</div>
+              <div className="list">{forSale.map((g) => renderCard(g, true))}</div>
             )}
-            <p className="hint" style={{ marginTop: 12 }}>
-              Mark a game as a keeper to hide it here, or tap Played if it made it back to the table.
-            </p>
-
             {sold.length > 0 && (
               <>
                 <h2>Sold: {sold.length} game{sold.length === 1 ? "" : "s"} for ${soldTotal}</h2>
