@@ -58,11 +58,11 @@ window.addEventListener("error", function (e) {
 <script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.28.4/babel.min.js"></script>
 </head>
 <body>
-<div id="root"><p id="boot">Loading your shelf… (version 1.7)</p></div>
+<div id="root"><p id="boot">Loading your shelf… (version 2.1)</p></div>
 <script type="text/babel" data-presets="react">
 const { useState, useEffect, useMemo, useRef } = React;
 
-const APP_VERSION = "1.7";
+const APP_VERSION = "2.1";
 const KEY = "boardgame-shelf-v1";
 const ART_KEY = "boardgame-art-v1";
 const SYNC_KEY = "boardgame-sync-v1";
@@ -529,7 +529,24 @@ const upcGame = (item) => ({
   year: item.published || item.year || null,
   image: [item.image_url, item.thumbnail_url, item.image, item.thumbnail].find((u) => typeof u === "string" && /^https:\/\//.test(u)) || null,
   updateUrl: item.update_url || null,
+  conf: typeof item.confidence === "number" ? item.confidence : null,
 });
+// Picks a match without asking when the answer is clear. Returns null when unsure.
+const EXP_WORDS = /\b(expansion|extension|exp\.|add-on|addon)\b/i;
+const pickConfident = (data, list) => {
+  if (!list.length) return null;
+  if (data.bgg_info_status === "verified") return list[0];
+  const title = String(data.searched_for || data.name || "");
+  const t = norm(title);
+  // Names that appear inside the store's product title; the longest (most specific) wins
+  const inTitle = t ? list.filter((o) => norm(o.name).length >= 4 && t.includes(norm(o.name))) : [];
+  let pick = inTitle.sort((a, b) => norm(b.name).length - norm(a.name).length)[0] || null;
+  if (!pick && list.length === 1 && t) pick = list[0];
+  if (!pick && list[0].conf != null && list[0].conf >= 0.8 && list[0].conf - (list[1]?.conf ?? 0) >= 0.2) pick = list[0];
+  // Don't file an expansion as its base game
+  if (pick && EXP_WORDS.test(title) && !EXP_WORDS.test(pick.name) && !/:/.test(pick.name)) return null;
+  return pick;
+};
 // Tells GameUPC which game this barcode is, so the next person gets a verified match
 const confirmUpc = (game) => {
   if (!game.updateUrl) return;
@@ -539,6 +556,213 @@ const confirmUpc = (game) => {
     body: JSON.stringify({ user_id: deviceId() }),
   }).catch(() => {});
 };
+
+// ---------- Continuous camera (reused by shelf scanning) ----------
+function useBarcodeCamera(active, videoRef, onCode, onError) {
+  const codeRef = useRef(onCode); codeRef.current = onCode;
+  const errRef = useRef(onError); errRef.current = onError;
+  useEffect(() => {
+    if (!active) return;
+    let stream = null;
+    let stopped = false;
+    let timer = null;
+    (async () => {
+      let det = null;
+      try { det = await getDetector(); } catch (e) { det = null; }
+      if (stopped) return;
+      if (!det) { errRef.current("The scanner engine couldn't load. Check your connection and try again."); return; }
+      try {
+        stream = await navigator.mediaDevices.getUserMedia({
+          audio: false,
+          video: { facingMode: { ideal: "environment" }, width: { ideal: 1920 }, height: { ideal: 1080 } },
+        });
+      } catch (e) {
+        if (!stopped) errRef.current("The camera couldn't start. Allow camera access for this site when asked (or in Settings, Apps, Safari, Camera).");
+        return;
+      }
+      if (stopped) { stream.getTracks().forEach((t) => t.stop()); return; }
+      const v = videoRef.current;
+      v.srcObject = stream;
+      try { await v.play(); } catch (e) { /* muted inline video can autoplay */ }
+      const canvas = document.createElement("canvas");
+      const ctx = canvas.getContext("2d", { willReadFrequently: true });
+      let n = 0;
+      const tick = async () => {
+        if (stopped) return;
+        try {
+          if (v.videoWidth) {
+            n++;
+            const full = n % 4 === 0;
+            const cw = full ? v.videoWidth : Math.round(v.videoWidth * 0.9);
+            const ch = full ? v.videoHeight : Math.round(v.videoHeight * 0.5);
+            canvas.width = cw; canvas.height = ch;
+            ctx.drawImage(v, (v.videoWidth - cw) / 2, (v.videoHeight - ch) / 2, cw, ch, 0, 0, cw, ch);
+            const r = await det.detect(canvas);
+            const hit = r.map((x) => x.rawValue).find(okCode);
+            if (hit) codeRef.current(hit);
+          }
+        } catch (e) { /* keep going */ }
+        timer = setTimeout(tick, 150);
+      };
+      tick();
+    })();
+    return () => {
+      stopped = true;
+      clearTimeout(timer);
+      if (stream) stream.getTracks().forEach((t) => t.stop());
+    };
+  }, [active]);
+}
+
+function PendingRow({ entry, games, onResolve }) {
+  const [name, setName] = useState("");
+  const match = name.trim() ? games.find((g) => norm(g.name) === norm(name)) : null;
+  return (
+    <div style={{ display: "grid", gap: 6, marginTop: 6 }}>
+      {(entry.options || []).map((o, i) => (
+        <button key={i} className="chip" style={{ justifySelf: "start", textAlign: "left" }} onClick={() => { confirmUpc(o); onResolve(entry.code, o); }}>
+          {o.name}{o.year ? ` (${o.year})` : ""}
+        </button>
+      ))}
+      <div className="bar" style={{ margin: 0 }}>
+        <input list="owned-names" placeholder="Type the game name" value={name} onChange={(e) => setName(e.target.value)} aria-label="Game name" />
+        <button className="btn ghost" disabled={!name.trim()} onClick={() => onResolve(entry.code, { name: name.trim() })}>{match ? "Link" : "Add"}</button>
+      </div>
+      <a className="hint" style={{ margin: 0 }} href={webSearch(`${entry.code} board game`)} target="_blank" rel="noreferrer">Look up barcode {entry.code} on the web</a>
+    </div>
+  );
+}
+
+function ShelfScan({ games, wishes, locations, onClose, onAssign, onAddNew, onRelink }) {
+  const [loc, setLoc] = useState("");
+  const [age, setAge] = useState("1");
+  const [running, setRunning] = useState(false);
+  const [err, setErr] = useState("");
+  const [log, setLog] = useState([]);
+  const videoRef = useRef(null);
+  const seen = useRef(new Set());
+  const queue = useRef(Promise.resolve());
+  const gamesRef = useRef(games); gamesRef.current = games;
+  const wishesRef = useRef(wishes); wishesRef.current = wishes;
+  const locRef = useRef(loc); locRef.current = loc;
+  const ageRef = useRef(age); ageRef.current = age;
+
+  const push = (code, entry) => setLog((l) => [{ code, ...entry }, ...l.filter((x) => x.code !== code)]);
+
+  const place = (code, info, guessOptions = null) => {
+    const where = locRef.current.trim();
+    const guess = guessOptions ? { guess: true, options: guessOptions } : {};
+    const mine = gamesRef.current.find((g) => (info.bggId && String(g.bgg?.id) === String(info.bggId)) || norm(g.name) === norm(info.name));
+    if (mine) {
+      const same = (mine.location || "").trim() === where;
+      onAssign(mine.id, where, code, info);
+      push(code, { name: mine.name, status: same ? "Already here" : mine.location ? `Moved from ${mine.location}` : "Location set", id: mine.id, existed: true, ...guess });
+    } else {
+      const id = onAddNew(info, code, where, Number(ageRef.current));
+      push(code, { name: info.name, status: guessOptions ? "Added to shelf (best match)" : "Added to shelf", id, ...guess });
+    }
+  };
+  // Fix a best-match guess: a game it added is corrected in place; otherwise place the right one
+  const fixGuess = (entry, info) => {
+    if (entry.id && !entry.existed) {
+      onRelink(entry.id, info, entry.code);
+      push(entry.code, { name: info.name, status: "Corrected", id: entry.id });
+    } else {
+      place(entry.code, info);
+    }
+  };
+
+  const processCode = async (code) => {
+    const known = gamesRef.current.find((g) => sameCode(g.upc, code));
+    if (known) { place(code, { name: known.name, bggId: known.bgg?.id }); return; }
+    const w = wishesRef.current.find((g) => sameCode(g.upc, code));
+    if (w) { push(code, { name: w.name, status: "On your wish list, skipped", warn: true }); return; }
+    push(code, { name: `Barcode ${code}`, status: "Looking up…" });
+    try {
+      const data = await gameUpc(code);
+      const list = (data.bgg_info || []).map(upcGame).filter((x) => x.name);
+      const sure = pickConfident(data, list);
+      if (sure) place(code, sure, data.bgg_info_status !== "verified" ? list.slice(0, 4) : null);
+      else push(code, { name: list[0] ? `Maybe ${list[0].name}?` : `Barcode ${code}`, status: "Needs a name", pending: true, options: list.slice(0, 3) });
+    } catch (e) {
+      push(code, { name: `Barcode ${code}`, status: "Needs a name (lookup failed)", pending: true, options: [] });
+    }
+  };
+
+  const onCode = (code) => {
+    if (seen.current.has(code)) return;
+    seen.current.add(code);
+    if (navigator.vibrate) navigator.vibrate(50);
+    queue.current = queue.current.then(() => processCode(code)).catch(() => {});
+  };
+
+  useBarcodeCamera(running, videoRef, onCode, (msg) => { setErr(msg); setRunning(false); });
+
+  const resolve = (code, info) => place(code, info);
+  const [fixing, setFixing] = useState("");
+  const done = log.filter((x) => !x.pending && !x.warn && x.status !== "Looking up…").length;
+  const pending = log.filter((x) => x.pending).length;
+
+  return (
+    <div className="sheet">
+      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+        <b style={{ fontSize: 17 }}>{running ? `Scanning into: ${loc}` : "Scan a shelf"}</b>
+        <button className="x" onClick={() => { setRunning(false); onClose(); }}>Close</button>
+      </div>
+
+      {!running && (
+        <>
+          <label className="f">Location for everything you scan
+            <input list="shelfscan-locs" value={loc} onChange={(e) => setLoc(e.target.value)} placeholder="e.g. Basement shelf" />
+            <datalist id="shelfscan-locs">{locations.map((l) => <option key={l} value={l} />)}</datalist>
+          </label>
+          <label className="f">New games found: when did you get them?
+            <select value={age} onChange={(e) => setAge(e.target.value)}>
+              {AGE_OPTIONS.map(([v, l]) => <option key={v} value={v}>{l}</option>)}
+            </select>
+          </label>
+          <button className="btn felt" style={{ padding: 14 }} disabled={!loc.trim()} onClick={() => { setErr(""); setRunning(true); }}>
+            {log.length ? "Keep scanning" : "Start scanning"}
+          </button>
+          {err && <p style={{ margin: 0, color: "var(--tag)", fontSize: 14 }}>{err}</p>}
+        </>
+      )}
+
+      {running && (
+        <>
+          <div style={{ position: "relative", width: "100%", borderRadius: 8, overflow: "hidden", background: "#000" }}>
+            <video ref={videoRef} playsInline muted autoPlay style={{ width: "100%", height: 260, objectFit: "cover", display: "block" }} />
+            <div aria-hidden="true" style={{ position: "absolute", left: "6%", right: "6%", top: "32%", bottom: "32%", border: "3px solid var(--meeple)", borderRadius: 8, boxShadow: "0 0 0 999px rgba(0,0,0,.25)" }} />
+          </div>
+          <p className="hint" style={{ margin: 0 }}>Move from box to box. Each barcode is handled as soon as it's read, and repeats are ignored.</p>
+          <button className="btn" onClick={() => setRunning(false)}>Done scanning</button>
+        </>
+      )}
+
+      {log.length > 0 && (
+        <>
+          <p style={{ margin: "4px 0 0", fontWeight: 700 }}>
+            {done} placed in {loc || "this location"}{pending ? `, ${pending} need${pending === 1 ? "s" : ""} a name` : ""}
+          </p>
+          <datalist id="owned-names">{games.map((g) => <option key={g.id} value={g.name} />)}</datalist>
+          <ul className="plays" style={{ gap: 8 }}>
+            {log.map((x) => (
+              <li key={x.code} style={{ display: "block", borderTop: "1px solid var(--line)", paddingTop: 6 }}>
+                <b>{x.name}</b>{" "}
+                <span style={{ color: x.pending || x.warn ? "var(--tag)" : "var(--muted)", fontSize: 13.5 }}>{x.status}</span>
+                {x.pending && <PendingRow entry={x} games={games} onResolve={resolve} />}
+                {x.guess && fixing !== x.code && <button className="x" style={{ padding: 0, marginLeft: 6 }} onClick={() => setFixing(x.code)}>Wrong game?</button>}
+                {x.guess && fixing === x.code && (
+                  <PendingRow entry={x} games={games} onResolve={(code, info) => { setFixing(""); fixGuess(x, info); }} />
+                )}
+              </li>
+            ))}
+          </ul>
+        </>
+      )}
+    </div>
+  );
+}
 
 function Scanner({ games, wishes, onClose, onAdd, onAddWish, onBought, onOpen, logPlay, onLink }) {
   // idle | reading | looking | local | found | choose | manual
@@ -575,8 +799,11 @@ function Scanner({ games, wishes, onClose, onAdd, onAddWish, onBought, onOpen, l
     try {
       const data = await gameUpc(c);
       const list = (data.bgg_info || []).map(upcGame).filter((x) => x.name);
-      if (data.bgg_info_status === "verified" && list.length) {
-        const gm = { ...list[0], _code: c };
+      const sure = pickConfident(data, list);
+      if (sure) {
+        const gm = { ...sure, _code: c, _guess: data.bgg_info_status !== "verified" };
+        setOptions(list.slice(0, 6));
+        setSearchTerms(data.searched_for || "");
         setGame(gm);
         linkAny(gm, c);
         setStage("found");
@@ -785,7 +1012,8 @@ function Scanner({ games, wishes, onClose, onAdd, onAddWish, onBought, onOpen, l
               </div>
             </>
           )}
-          <button className="x" style={{ justifySelf: "start", padding: 0 }} onClick={() => { setName(""); setStage("manual"); }}>Wrong game?</button>
+          {game._guess && <p className="hint" style={{ margin: 0 }}>Best match from the barcode's product name. Not right? Tap Wrong game.</p>}
+          <button className="x" style={{ justifySelf: "start", padding: 0 }} onClick={() => { setName(""); setStage(options.length ? "choose" : "manual"); }}>Wrong game?</button>
           {again}
         </>
       )}
@@ -828,6 +1056,57 @@ function Scanner({ games, wishes, onClose, onAdd, onAddWish, onBought, onOpen, l
   );
 }
 
+function BarcodeFix({ g, upd, onRelink }) {
+  const [open, setOpen] = useState(false);
+  const [loading, setLoading] = useState(false);
+  const [options, setOptions] = useState([]);
+  const [err, setErr] = useState("");
+  const [name, setName] = useState("");
+  const load = async () => {
+    setOpen(true); setLoading(true); setErr("");
+    try {
+      const data = await gameUpc(g.upc);
+      setOptions((data.bgg_info || []).map(upcGame).filter((x) => x.name).slice(0, 6));
+    } catch (e) { setErr(`Couldn't reach the barcode database (${e.message}). You can still type the right name.`); }
+    setLoading(false);
+  };
+  const choose = (info, vote) => {
+    if (vote) confirmUpc(info);
+    onRelink(g.id, info, g.upc);
+    setOpen(false); setOptions([]); setName("");
+  };
+  return (
+    <div>
+      <label className="f">Barcode</label>
+      <p style={{ margin: "4px 0 6px" }}>{g.upc}</p>
+      {!open ? (
+        <div className="bar" style={{ margin: 0, flexWrap: "wrap" }}>
+          <button className="btn ghost" onClick={load}>Wrong game? Pick again</button>
+          <button className="x" style={{ padding: 0 }} onClick={() => upd(g.id, (x) => ({ ...x, upc: undefined }))}>Forget barcode</button>
+        </div>
+      ) : (
+        <div style={{ display: "grid", gap: 6 }}>
+          {loading && <p className="hint" style={{ margin: 0 }}>Looking up the barcode…</p>}
+          {err && <p className="hint" style={{ margin: 0, color: "var(--tag)" }}>{err}</p>}
+          {options.filter((o) => String(o.bggId) !== String(g.bgg?.id)).map((o, i) => (
+            <button key={i} className="pick" style={{ textAlign: "left", cursor: "pointer", color: "var(--ink)", background: "var(--card)" }} onClick={() => choose(o, true)}>
+              {o.image && <img src={o.image} alt="" style={{ width: 40, height: 40, objectFit: "contain" }} onError={(e) => (e.target.style.display = "none")} />}
+              <span><b>{o.name}</b>{o.year ? ` (${o.year})` : ""}</span>
+            </button>
+          ))}
+          {!loading && !err && options.length === 0 && <p className="hint" style={{ margin: 0 }}>No other suggestions for this barcode. Type the right name below.</p>}
+          <div className="bar" style={{ margin: 0 }}>
+            <input placeholder="Or type the right game name" value={name} onChange={(e) => setName(e.target.value)} aria-label="Right game name" />
+            <button className="btn ghost" disabled={!name.trim()} onClick={() => choose({ name: name.trim() }, false)}>Fix</button>
+          </div>
+          <button className="x" style={{ justifySelf: "start", padding: 0, color: "var(--ink)" }} onClick={() => setOpen(false)}>Cancel</button>
+          <p className="hint" style={{ margin: 0 }}>Fixing keeps this game's plays, location, and other details, and updates its name, BGG link, box art, and price.</p>
+        </div>
+      )}
+    </div>
+  );
+}
+
 class SafeDetail extends React.Component {
   constructor(props) { super(props); this.state = { error: null }; }
   static getDerivedStateFromError(error) { return { error }; }
@@ -843,7 +1122,7 @@ class SafeDetail extends React.Component {
   }
 }
 
-function Detail({ g, upd, logPlay, remove, artApi, checkTitle, checking, onBought, openSelling, locations = [], priceCheck, pricing }) {
+function Detail({ g, upd, logPlay, remove, artApi, checkTitle, checking, onBought, openSelling, locations = [], priceCheck, pricing, onRelink }) {
   const isWish = g.status === "wish";
   const linked = !!g.bgg?.id;
   const [pastDate, setPastDate] = useState(today());
@@ -1143,6 +1422,7 @@ function Detail({ g, upd, logPlay, remove, artApi, checkTitle, checking, onBough
               {sellingBody}
             </details>
           )}
+          {g.upc && onRelink && <BarcodeFix g={g} upd={upd} onRelink={onRelink} />}
           {unlinkRow}
           {deleteBtn}
         </div>
@@ -1160,6 +1440,7 @@ function App() {
   const [open, setOpen] = useState(null);
   const [adding, setAdding] = useState(false);
   const [scanning, setScanning] = useState(false);
+  const [shelfScan, setShelfScan] = useState(false);
   const [bulk, setBulk] = useState(false);
   const [form, setForm] = useState({ name: "", condition: "Good", ownedSince: today() });
   const [bulkText, setBulkText] = useState("");
@@ -1479,6 +1760,38 @@ function App() {
     if (!info.bggId) checkTitles([g]);
   };
 
+  // ---------- Shelf scanning ----------
+  const assignLocation = (id, loc, code, info) => {
+    upd(id, (x) => ({
+      ...x,
+      location: loc,
+      upc: code || x.upc,
+      bgg: x.bgg?.id ? x.bgg : info?.bggId ? { id: String(info.bggId), slug: "", year: info.year || null } : x.bgg,
+    }));
+    if (info?.image) putArt(id, info.image, true);
+  };
+  const addScannedToLocation = (info, code, loc, years) => {
+    const g = {
+      id: uid(), name: info.name, condition: "Good", ownedSince: yearsAgo(years), addedAt: today(),
+      plays: [], keep: false, status: "owned", upc: code, location: loc, updatedAt: Date.now(),
+      ...(info.bggId ? { bgg: { id: String(info.bggId), slug: "", year: info.year || null } } : {}),
+    };
+    setData((d) => ({ ...d, games: [...d.games, g] }));
+    if (info.image) putArt(g.id, info.image);
+    if (!info.bggId) checkTitles([g]);
+    return g.id;
+  };
+  const relinkGame = (id, info, code) => {
+    priceTried.current.delete(id);
+    upd(id, (x) => ({
+      ...x, name: info.name, upc: code || x.upc, market: undefined, review: undefined,
+      bgg: info.bggId ? { id: String(info.bggId), slug: "", year: info.year || null } : undefined,
+      bggNone: !info.bggId ? undefined : false,
+    }));
+    if (info.image) putArt(id, info.image);
+    if (!info.bggId) checkTitles([{ ...data.games.find((g) => g.id === id), name: info.name, bgg: undefined }]);
+  };
+
   // ---------- Wish list ----------
   const newWish = (name, extra = {}) => ({
     id: uid(), name, status: "wish", priority: wishPriority, condition: "Good", ownedSince: today(),
@@ -1584,7 +1897,7 @@ function App() {
           ) : sale && !isOpen ? (
             <p className="note">No prices yet. Tap the name to check eBay and set them.</p>
           ) : null}
-          {isOpen && <SafeDetail key={g.id} g={g} upd={upd} logPlay={logPlay} remove={remove} artApi={{ hasArt: !!art[g.id], broken: !!broken[g.id], setPhoto, setArtUrl, clearArt }} checkTitle={checkTitles} checking={checking} onBought={bought} openSelling={sale} locations={locations} priceCheck={priceCheck} pricing={pricing} />}
+          {isOpen && <SafeDetail key={g.id} g={g} upd={upd} logPlay={logPlay} remove={remove} artApi={{ hasArt: !!art[g.id], broken: !!broken[g.id], setPhoto, setArtUrl, clearArt }} checkTitle={checkTitles} checking={checking} onBought={bought} openSelling={sale} locations={locations} priceCheck={priceCheck} pricing={pricing} onRelink={relinkGame} />}
         </div>
       </div>
     );
@@ -1631,7 +1944,7 @@ function App() {
         </p>
 
         <div className="tabs" role="tablist">
-          <button className="tab" role="tab" aria-selected={tab === "shelf"} onClick={() => { setTab("shelf"); setScanning(false); }}>Shelf</button>
+          <button className="tab" role="tab" aria-selected={tab === "shelf"} onClick={() => { setTab("shelf"); setScanning(false); setShelfScan(false); }}>Shelf</button>
           <button className="tab" role="tab" aria-selected={tab === "dust"} onClick={() => { setTab("dust"); setScanning(false); }}>Unplayed ({dusty.length})</button>
           <button className="tab" role="tab" aria-selected={tab === "sale"} onClick={() => { setTab("sale"); setScanning(false); }}>For sale ({forSale.length})</button>
           <button className="tab" role="tab" aria-selected={tab === "wish"} onClick={() => { setTab("wish"); setScanning(false); }}>Wish list ({wishes.length})</button>
@@ -1680,12 +1993,15 @@ function App() {
               </div>
             ) : scanning ? (
               scannerEl
+            ) : shelfScan ? (
+              <ShelfScan games={owned} wishes={wishes} locations={locations} onClose={() => setShelfScan(false)} onAssign={assignLocation} onAddNew={addScannedToLocation} onRelink={relinkGame} />
             ) : (
               <>
                 <div className="bar">
                   <button className="btn felt" style={{ flex: 1 }} onClick={() => setScanning(true)}>Scan barcode</button>
                   <button className="btn" style={{ flex: 1 }} onClick={() => setAdding(true)}>Add by name</button>
                 </div>
+                <button className="btn ghost" style={{ width: "100%", marginBottom: 12 }} onClick={() => setShelfScan(true)}>Scan a shelf into a location</button>
                 <div className="bar">
                   <input placeholder="Search your games" value={q} onChange={(e) => setQ(e.target.value)} aria-label="Search games" />
                   <select value={sort} onChange={(e) => setSort(e.target.value)} style={{ width: "auto" }} aria-label="Sort">
