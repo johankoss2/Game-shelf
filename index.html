@@ -89,7 +89,9 @@ const sameCode = (a, b) => a && b && a.replace(/^0+/, "") === b.replace(/^0+/, "
 // ---------- Outside links (no keys, no accounts) ----------
 const enc = encodeURIComponent;
 const bggSearch = (name) => `https://boardgamegeek.com/geeksearch.php?action=search&objecttype=boardgame&q=${enc(name)}`;
-const bggUrl = (b) => `https://boardgamegeek.com/boardgame/${b.id}${b.slug ? "/" + b.slug : ""}`;
+const slugify = (s) => (s || "").toLowerCase().normalize("NFKD").replace(/[\u0300-\u036f]/g, "").replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "");
+// Full game link (id + name), like BGG's own. web=true uses www. so iPhone keeps it in Safari instead of the BGG app
+const bggUrl = (b, name, web = false) => `https://${web ? "www." : ""}boardgamegeek.com/boardgame/${b.id}/${b.slug || slugify(name)}`;
 const parseBgg = (url) => {
   const m = (url || "").match(/boardgamegeek\.com\/boardgame(?:expansion)?\/(\d+)(?:\/([^/?#\s]+))?/i);
   return m ? { id: m[1], slug: m[2] || "" } : null;
@@ -281,6 +283,29 @@ const loadScript = (src) =>
     s.src = src; s.onload = res; s.onerror = rej;
     document.head.appendChild(s);
   });
+async function ensureScanLib() {
+  if (window.Html5Qrcode) return;
+  bcLib = bcLib || loadScript("https://cdnjs.cloudflare.com/ajax/libs/html5-qrcode/2.3.8/html5-qrcode.min.js");
+  try { await bcLib; } catch (e) { bcLib = null; throw e; }
+}
+const scanFormats = () => {
+  const F = window.Html5QrcodeSupportedFormats;
+  return [F.EAN_13, F.UPC_A, F.UPC_E, F.EAN_8];
+};
+const rotated = async (file, max) => {
+  const img = await loadImage(file).catch(() => null);
+  if (!img) return null;
+  const s = Math.min(1, max / Math.max(img.width, img.height));
+  const w = Math.round(img.width * s), h = Math.round(img.height * s);
+  const c = document.createElement("canvas");
+  c.width = h; c.height = w;
+  const x = c.getContext("2d");
+  x.translate(h / 2, w / 2);
+  x.rotate(Math.PI / 2);
+  x.drawImage(img, -w / 2, -h / 2, w, h);
+  return new Promise((res) => c.toBlob((b) => res(b ? new File([b], "turned.jpg", { type: "image/jpeg" }) : null), "image/jpeg", 0.9));
+};
+
 async function decodeBarcode(file) {
   if ("BarcodeDetector" in window) {
     try {
@@ -289,10 +314,7 @@ async function decodeBarcode(file) {
       if (r.length) return r[0].rawValue;
     } catch (e) { /* fall through */ }
   }
-  if (!window.Html5Qrcode) {
-    bcLib = bcLib || loadScript("https://cdnjs.cloudflare.com/ajax/libs/html5-qrcode/2.3.8/html5-qrcode.min.js");
-    try { await bcLib; } catch (e) { bcLib = null; throw e; }
-  }
+  await ensureScanLib();
   let el = document.getElementById("bc-reader");
   if (!el) {
     el = document.createElement("div");
@@ -302,9 +324,14 @@ async function decodeBarcode(file) {
   }
   const F = window.Html5QrcodeSupportedFormats;
   const h = new window.Html5Qrcode("bc-reader", { formatsToSupport: [F.EAN_13, F.UPC_A, F.UPC_E, F.EAN_8], verbose: false });
-  const small = await downscale(file, 1600);
-  try { return await h.scanFile(small, false); }
-  finally { try { h.clear(); } catch (e) { /* ignore */ } }
+  // Try a few sizes and a sideways turn before giving up
+  const tries = [await downscale(file, 1600), await downscale(file, 1000), await rotated(file, 1400), await downscale(file, 2400)].filter(Boolean);
+  try {
+    for (const f of tries) {
+      try { return await h.scanFile(f, false); } catch (e) { /* try the next version */ }
+    }
+    throw new Error("No barcode found");
+  } finally { try { h.clear(); } catch (e) { /* ignore */ } }
 }
 
 const css = `
@@ -425,6 +452,7 @@ function Scanner({ games, onClose, onAdd, onOpen, logPlay, onLink }) {
 
   const ownedMatch = (gm) => gm && games.find((g) => (gm.bggId && String(g.bgg?.id) === gm.bggId) || norm(g.name) === norm(gm.name));
   const reset = () => { setStage("idle"); setErr(""); setName(""); setManual(""); setCode(""); setGame(null); setOptions([]); setSearchTerms(""); setNote(""); };
+  const liveDone = useRef(false);
 
   const showGame = (gm) => {
     setGame(gm);
@@ -488,6 +516,46 @@ function Scanner({ games, onClose, onAdd, onOpen, logPlay, onLink }) {
     }
   };
 
+  // Live camera: keeps scanning frames until it reads a barcode
+  useEffect(() => {
+    if (stage !== "live") return;
+    let scanner = null;
+    let cancelled = false;
+    liveDone.current = false;
+    (async () => {
+      try {
+        await ensureScanLib();
+        if (cancelled) return;
+        scanner = new window.Html5Qrcode("live-reader", {
+          formatsToSupport: scanFormats(),
+          verbose: false,
+          experimentalFeatures: { useBarCodeDetectorIfSupported: true },
+        });
+        await scanner.start(
+          { facingMode: "environment" },
+          { fps: 12, qrbox: (w, h) => ({ width: Math.floor(w * 0.9), height: Math.max(90, Math.floor(h * 0.45)) }) },
+          (text) => {
+            if (liveDone.current) return;
+            liveDone.current = true;
+            if (navigator.vibrate) navigator.vibrate(60);
+            scanner.stop().catch(() => {}).finally(() => lookup(text));
+          },
+          () => {}
+        );
+        if (cancelled) scanner.stop().catch(() => {});
+      } catch (e) {
+        if (!cancelled) {
+          setErr("The camera couldn't start. If Safari asked about camera access, allow it and try again, or take a photo instead.");
+          setStage("idle");
+        }
+      }
+    })();
+    return () => {
+      cancelled = true;
+      try { if (scanner && scanner.isScanning) scanner.stop().catch(() => {}); } catch (e) { /* ignore */ }
+    };
+  }, [stage]);
+
   const local = code ? games.find((g) => sameCode(g.upc, code)) : null;
   const mine = stage === "found" ? ownedMatch(game) : null;
   const nameMatch = name.trim() ? games.find((g) => norm(g.name) === norm(name)) : null;
@@ -504,7 +572,7 @@ function Scanner({ games, onClose, onAdd, onOpen, logPlay, onLink }) {
       <div className="bar" style={{ margin: 0, flexWrap: "wrap" }}>
         <button className="btn felt" onClick={() => { logPlay(g); onClose(); }}>Log a play</button>
         <button className="btn ghost" onClick={() => onOpen(g.id)}>Open it</button>
-        {g.bgg?.id && <a className="btn ghost" href={bggUrl(g.bgg)} target="_blank" rel="noreferrer">View on BGG</a>}
+        {g.bgg?.id && <a className="btn ghost" href={bggUrl(g.bgg, g.name)} target="_blank" rel="noreferrer">View on BGG</a>}
       </div>
     </>
   );
@@ -519,8 +587,9 @@ function Scanner({ games, onClose, onAdd, onOpen, logPlay, onLink }) {
 
       {stage === "idle" && (
         <>
-          <label className="btn felt filebtn" style={{ padding: 14 }}>
-            Take a photo of the barcode
+          <button className="btn felt" style={{ padding: 14 }} onClick={() => { setErr(""); setStage("live"); }}>Scan with camera</button>
+          <label className="btn ghost filebtn">
+            Take a photo instead
             <input type="file" accept="image/*" capture="environment" hidden onChange={(e) => { const f = e.target.files[0]; e.target.value = ""; f && onPhoto(f); }} />
           </label>
           <div className="bar" style={{ margin: 0 }}>
@@ -528,6 +597,14 @@ function Scanner({ games, onClose, onAdd, onOpen, logPlay, onLink }) {
             <button className="btn ghost" onClick={() => lookup(manual)}>Go</button>
           </div>
           {err && <p style={{ margin: 0, color: "var(--tag)", fontSize: 14 }}>{err}</p>}
+        </>
+      )}
+
+      {stage === "live" && (
+        <>
+          <div id="live-reader" style={{ width: "100%", minHeight: 240, borderRadius: 8, overflow: "hidden", background: "#000" }} />
+          <p className="hint" style={{ margin: 0 }}>Point at the barcode and hold steady about 6 inches away. It scans on its own.</p>
+          <button className="btn ghost" onClick={() => setStage("idle")}>Cancel</button>
         </>
       )}
 
@@ -553,7 +630,7 @@ function Scanner({ games, onClose, onAdd, onOpen, logPlay, onLink }) {
               {ageSelect}
               <div className="bar" style={{ margin: 0, flexWrap: "wrap" }}>
                 <button className="btn" onClick={() => onAdd(game, code, Number(age))}>Add to shelf</button>
-                {game.bggId && <a className="btn ghost" href={bggUrl({ id: game.bggId })} target="_blank" rel="noreferrer">View on BGG</a>}
+                {game.bggId && <a className="btn ghost" href={bggUrl({ id: game.bggId }, game.name)} target="_blank" rel="noreferrer">View on BGG</a>}
               </div>
             </>
           )}
@@ -627,8 +704,9 @@ function Detail({ g, upd, logPlay, remove, artApi, checkTitle, checking }) {
         <label className="f">BoardGameGeek</label>
         {g.bgg?.id ? (
           <>
-          <div className="bar" style={{ margin: "6px 0 0" }}>
-            <a className="btn ghost" href={bggUrl(g.bgg)} target="_blank" rel="noreferrer">Open on BGG</a>
+          <div className="bar" style={{ margin: "6px 0 0", flexWrap: "wrap" }}>
+            <a className="btn ghost" href={bggUrl(g.bgg, g.name)} target="_blank" rel="noreferrer">Open on BGG</a>
+            <a className="btn ghost" href={bggUrl(g.bgg, g.name, true)} target="_blank" rel="noreferrer">Open in browser</a>
             <button className="x" onClick={() => upd(g.id, (x) => ({ ...x, bgg: undefined, bggNone: true }))}>Unlink</button>
           </div>
           <p className="hint">Own a different edition with its own BGG page? Tap Unlink, then search for it and paste that page's link.</p>
