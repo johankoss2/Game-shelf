@@ -100,6 +100,9 @@ const ebaySold = (name) => `https://www.ebay.com/sch/i.html?_nkw=${enc(name + " 
 const fbSearch = (name) => `https://www.facebook.com/marketplace/search/?query=${enc(name + " board game")}`;
 const webSearch = (q) => `https://www.google.com/search?q=${enc(q)}`;
 const fullName = (g) => (g.edition ? `${g.name} ${g.edition}` : g.name);
+const PRIORITIES = ["Must have", "Want", "Maybe"];
+const shopSearch = (name) => `https://www.google.com/search?tbm=shop&q=${enc(name + " board game")}`;
+const wishLine = (g) => [g.priority || "Want", g.maxPrice ? `would pay up to $${g.maxPrice}` : null].filter(Boolean).join(", ");
 const EDITIONS = ["1st edition", "2nd edition", "3rd edition", "Revised edition", "Anniversary edition", "Big box", "Deluxe edition", "Collector's edition"];
 const bggViaGoogle = (name) => webSearch(`"${name}" board game site:boardgamegeek.com/boardgame`);
 
@@ -437,7 +440,7 @@ const confirmUpc = (game) => {
   }).catch(() => {});
 };
 
-function Scanner({ games, onClose, onAdd, onOpen, logPlay, onLink }) {
+function Scanner({ games, wishes, onClose, onAdd, onAddWish, onBought, onOpen, logPlay, onLink }) {
   // idle | reading | looking | local | found | choose | manual
   const [stage, setStage] = useState("idle");
   const [code, setCode] = useState("");
@@ -451,13 +454,14 @@ function Scanner({ games, onClose, onAdd, onOpen, logPlay, onLink }) {
   const [note, setNote] = useState("");
 
   const ownedMatch = (gm) => gm && games.find((g) => (gm.bggId && String(g.bgg?.id) === gm.bggId) || norm(g.name) === norm(gm.name));
+  const wishMatch = (gm) => gm && wishes.find((g) => (gm.bggId && String(g.bgg?.id) === gm.bggId) || norm(g.name) === norm(gm.name));
+  const linkAny = (gm, c) => { const hit = ownedMatch(gm) || wishMatch(gm); if (hit) onLink(hit.id, c, gm); };
   const reset = () => { setStage("idle"); setErr(""); setName(""); setManual(""); setCode(""); setGame(null); setOptions([]); setSearchTerms(""); setNote(""); };
   const liveDone = useRef(false);
 
   const showGame = (gm) => {
     setGame(gm);
-    const mine = ownedMatch(gm);
-    if (mine) onLink(mine.id, code || gm._code, gm);
+    linkAny(gm, code || gm._code);
     setStage("found");
   };
 
@@ -465,7 +469,7 @@ function Scanner({ games, onClose, onAdd, onOpen, logPlay, onLink }) {
     const c = (raw || "").replace(/\D/g, "");
     if (c.length < 8) { setErr("That doesn't look like a full barcode number."); setStage("idle"); return; }
     setCode(c); setErr("");
-    if (games.find((g) => sameCode(g.upc, c))) { setStage("local"); return; }
+    if (games.find((g) => sameCode(g.upc, c)) || wishes.find((g) => sameCode(g.upc, c))) { setStage("local"); return; }
     setStage("looking");
     try {
       const data = await gameUpc(c);
@@ -473,8 +477,7 @@ function Scanner({ games, onClose, onAdd, onOpen, logPlay, onLink }) {
       if (data.bgg_info_status === "verified" && list.length) {
         const gm = { ...list[0], _code: c };
         setGame(gm);
-        const mine = ownedMatch(gm);
-        if (mine) onLink(mine.id, c, gm);
+        linkAny(gm, c);
         setStage("found");
       } else if (list.length) {
         setOptions(list.slice(0, 6));
@@ -557,7 +560,9 @@ function Scanner({ games, onClose, onAdd, onOpen, logPlay, onLink }) {
   }, [stage]);
 
   const local = code ? games.find((g) => sameCode(g.upc, code)) : null;
+  const localWish = code && !local ? wishes.find((g) => sameCode(g.upc, code)) : null;
   const mine = stage === "found" ? ownedMatch(game) : null;
+  const wished = stage === "found" && !mine ? wishMatch(game) : null;
   const nameMatch = name.trim() ? games.find((g) => norm(g.name) === norm(name)) : null;
   const ageSelect = (
     <label className="f">When did you get it?
@@ -571,6 +576,17 @@ function Scanner({ games, onClose, onAdd, onOpen, logPlay, onLink }) {
       <p style={{ margin: 0 }}>Already on your shelf.</p>
       <div className="bar" style={{ margin: 0, flexWrap: "wrap" }}>
         <button className="btn felt" onClick={() => { logPlay(g); onClose(); }}>Log a play</button>
+        <button className="btn ghost" onClick={() => onOpen(g.id)}>Open it</button>
+        {g.bgg?.id && <a className="btn ghost" href={bggUrl(g.bgg, g.name)} target="_blank" rel="noreferrer">View on BGG</a>}
+      </div>
+    </>
+  );
+  const onWish = (g) => (
+    <>
+      <p style={{ margin: 0 }}>On your wish list: {wishLine(g).toLowerCase()}.</p>
+      {g.note && <p className="hint" style={{ margin: 0 }}>{g.note}</p>}
+      <div className="bar" style={{ margin: 0, flexWrap: "wrap" }}>
+        <button className="btn felt" onClick={() => { onBought(g); onClose(); }}>We bought it</button>
         <button className="btn ghost" onClick={() => onOpen(g.id)}>Open it</button>
         {g.bgg?.id && <a className="btn ghost" href={bggUrl(g.bgg, g.name)} target="_blank" rel="noreferrer">View on BGG</a>}
       </div>
@@ -611,10 +627,10 @@ function Scanner({ games, onClose, onAdd, onOpen, logPlay, onLink }) {
       {stage === "reading" && <p style={{ margin: 0 }} role="status">Reading the barcode…</p>}
       {stage === "looking" && <p style={{ margin: 0 }} role="status">Looking up {code}…</p>}
 
-      {stage === "local" && local && (
+      {stage === "local" && (local || localWish) && (
         <>
-          <div className="pick"><b>{local.name}</b></div>
-          {onShelf(local)}
+          <div className="pick"><b>{(local || localWish).name}</b></div>
+          {local ? onShelf(local) : onWish(localWish)}
           {again}
         </>
       )}
@@ -625,11 +641,12 @@ function Scanner({ games, onClose, onAdd, onOpen, logPlay, onLink }) {
             {game.image && <img src={game.image} alt="" style={{ width: 48, height: 48, objectFit: "contain" }} onError={(e) => (e.target.style.display = "none")} />}
             <span><b>{game.name}</b>{game.year ? ` (${game.year})` : ""}</span>
           </div>
-          {mine ? onShelf(mine) : (
+          {mine ? onShelf(mine) : wished ? onWish(wished) : (
             <>
               {ageSelect}
               <div className="bar" style={{ margin: 0, flexWrap: "wrap" }}>
                 <button className="btn" onClick={() => onAdd(game, code, Number(age))}>Add to shelf</button>
+                <button className="btn ghost" onClick={() => onAddWish(game, code)}>Add to wish list</button>
                 {game.bggId && <a className="btn ghost" href={bggUrl({ id: game.bggId }, game.name)} target="_blank" rel="noreferrer">View on BGG</a>}
               </div>
             </>
@@ -669,6 +686,7 @@ function Scanner({ games, onClose, onAdd, onOpen, logPlay, onLink }) {
           <button className="btn" disabled={!name.trim()} onClick={() => onAdd({ name: name.trim() }, code, Number(age))}>
             {nameMatch ? `Link barcode to ${nameMatch.name}` : "Add to shelf"}
           </button>
+          {!nameMatch && <button className="btn ghost" disabled={!name.trim()} onClick={() => onAddWish({ name: name.trim() }, code)}>Add to wish list</button>}
           {again}
         </>
       )}
@@ -676,7 +694,8 @@ function Scanner({ games, onClose, onAdd, onOpen, logPlay, onLink }) {
   );
 }
 
-function Detail({ g, upd, logPlay, remove, artApi, checkTitle, checking }) {
+function Detail({ g, upd, logPlay, remove, artApi, checkTitle, checking, onBought }) {
+  const isWish = g.status === "wish";
   const [pastDate, setPastDate] = useState(today());
   const [soldFor, setSoldFor] = useState("");
   const [bggLink, setBggLink] = useState("");
@@ -751,6 +770,31 @@ function Detail({ g, upd, logPlay, remove, artApi, checkTitle, checking }) {
         <p className="hint">On the BGG page, long-press the box image, choose Open in New Tab, then copy that tab's address.</p>
       </div>
 
+      {isWish && (
+        <>
+          <div className="two">
+            <label className="f">Priority
+              <select value={g.priority || "Want"} onChange={(e) => upd(g.id, (x) => ({ ...x, priority: e.target.value }))}>
+                {PRIORITIES.map((v) => <option key={v}>{v}</option>)}
+              </select>
+            </label>
+            <label className="f">Would pay up to
+              <input inputMode="decimal" placeholder="$" value={g.maxPrice ?? ""} onChange={(e) => { const v = e.target.value.replace(/[^0-9.]/g, ""); upd(g.id, (x) => ({ ...x, maxPrice: v === "" ? null : Number(v) })); }} />
+            </label>
+          </div>
+          <label className="f">Notes
+            <input value={g.note || ""} placeholder="Who wants it, why, where you saw it" onChange={(e) => upd(g.id, (x) => ({ ...x, note: e.target.value }))} />
+          </label>
+          <div className="bar" style={{ margin: 0, flexWrap: "wrap" }}>
+            <a className="btn ghost" href={shopSearch(fullName(g))} target="_blank" rel="noreferrer">Compare new prices</a>
+            <a className="btn ghost" href={ebaySold(fullName(g))} target="_blank" rel="noreferrer">eBay sold (used)</a>
+          </div>
+          <button className="btn felt" style={{ justifySelf: "start" }} onClick={() => onBought(g)}>We bought it, move to shelf</button>
+        </>
+      )}
+
+      {!isWish && (
+      <>
       <div>
         <label className="f">Prices</label>
         <div className="bar" style={{ margin: "6px 0 10px", flexWrap: "wrap" }}>
@@ -818,7 +862,9 @@ function Detail({ g, upd, logPlay, remove, artApi, checkTitle, checking }) {
           <button className="btn tag" onClick={() => upd(g.id, (x) => ({ ...x, status: "sold", soldFor: Number(soldFor) || 0, soldOn: today() }))}>Mark sold</button>
         </div>
       </div>
-      <button className="x" style={{ justifySelf: "start", padding: 0 }} onClick={() => remove(g)}>Delete game from shelf</button>
+      </>
+      )}
+      <button className="x" style={{ justifySelf: "start", padding: 0 }} onClick={() => remove(g)}>{isWish ? "Remove from wish list" : "Delete game from shelf"}</button>
     </div>
   );
 }
@@ -845,6 +891,9 @@ function App() {
   const [importText, setImportText] = useState("");
   const [justPlayed, setJustPlayed] = useState(null);
   const [checking, setChecking] = useState(false);
+  const [wishName, setWishName] = useState("");
+  const [wishPriority, setWishPriority] = useState("Want");
+  const [wishText, setWishText] = useState("");
   const [syncCfg, setSyncCfg] = useState(null);
   const [sync, setSync] = useState({ state: "off" });
   const [repoDraft, setRepoDraft] = useState("");
@@ -1051,13 +1100,17 @@ function App() {
     setChecking(false);
   };
 
-  const openGame = (id) => {
-    setScanning(false); setTab("shelf"); setQ(""); setOpen(id);
+  const openGame = (id, tabName) => {
+    const st = dataRef.current.games.find((x) => x.id === id)?.status;
+    setScanning(false); setTab(tabName || (st === "wish" ? "wish" : "shelf")); setQ(""); setOpen(id);
     setTimeout(() => document.getElementById(`g-${id}`)?.scrollIntoView({ behavior: "smooth", block: "center" }), 120);
   };
 
   const threshold = data.dustMonths * 30;
-  const owned = data.games.filter((g) => g.status !== "sold");
+  const owned = data.games.filter((g) => (g.status || "owned") === "owned");
+  const wishes = data.games.filter((g) => g.status === "wish")
+    .sort((a, b) => PRIORITIES.indexOf(a.priority || "Want") - PRIORITIES.indexOf(b.priority || "Want") || a.name.localeCompare(b.name));
+  const wishReviews = wishes.filter((g) => g.review);
   const sold = data.games.filter((g) => g.status === "sold");
   const dusty = owned.filter((g) => !g.keep && idleDays(g) >= threshold).sort((a, b) => idleDays(b) - idleDays(a));
   const reviews = owned.filter((g) => g.review);
@@ -1095,6 +1148,46 @@ function App() {
     if (!info.bggId) checkTitles([g]);
   };
 
+  // ---------- Wish list ----------
+  const newWish = (name, extra = {}) => ({
+    id: uid(), name, status: "wish", priority: wishPriority, condition: "Good", ownedSince: today(),
+    plays: [], keep: false, updatedAt: Date.now(), ...extra,
+  });
+  const addWish = () => {
+    const name = wishName.trim();
+    if (!name) return;
+    const dupe = [...owned, ...wishes].find((g) => norm(g.name) === norm(name));
+    if (dupe) { setToast(dupe.status === "wish" ? `${dupe.name} is already on the wish list` : `You already own ${dupe.name}`); openGame(dupe.id); return; }
+    const g = newWish(name);
+    setData((d) => ({ ...d, games: [...d.games, g] }));
+    setWishName("");
+    setToast(`Added ${name} to the wish list. Checking title…`);
+    checkTitles([g]);
+  };
+  const addWishFromScan = (info, code) => {
+    const match = wishes.find((g) => (info.bggId && String(g.bgg?.id) === info.bggId) || norm(g.name) === norm(info.name));
+    if (match) { linkScan(match.id, code, info); openGame(match.id, "wish"); return; }
+    const g = newWish(info.name, { priority: "Want", upc: code, ...(info.bggId ? { bgg: { id: info.bggId, slug: "", year: info.year || null } } : {}) });
+    setData((d) => ({ ...d, games: [...d.games, g] }));
+    if (info.image) putArt(g.id, info.image);
+    setToast(`Added ${info.name} to the wish list`);
+    openGame(g.id, "wish");
+    if (!info.bggId) checkTitles([g]);
+  };
+  const bought = (g) => {
+    upd(g.id, (x) => ({ ...x, status: "owned", ownedSince: today(), boughtOn: today(), review: undefined }));
+    setToast(`${g.name} moved to your shelf. Enjoy!`);
+    openGame(g.id, "shelf");
+  };
+  const copyWishes = async () => {
+    const text = "Our board game wish list\n\n" + PRIORITIES.map((p) => {
+      const items = wishes.filter((g) => (g.priority || "Want") === p);
+      return items.length ? `${p}:\n` + items.map((g) => `- ${g.name}${g.edition ? ` (${g.edition})` : ""}${g.bgg?.id ? `  ${bggUrl(g.bgg, g.name, true)}` : ""}`).join("\n") : "";
+    }).filter(Boolean).join("\n\n");
+    try { await navigator.clipboard.writeText(text); setToast("Wish list copied"); setWishText(""); }
+    catch (e) { setWishText(text); }
+  };
+
   const addGames = () => {
     const names = bulk ? bulkText.split("\n").map((s) => s.trim()).filter(Boolean) : [form.name.trim()].filter(Boolean);
     if (!names.length) return;
@@ -1122,8 +1215,10 @@ function App() {
     catch (e) { setCopyText(text); }
   };
 
-  const renderCard = (g, sale) => {
-    const level = Math.min(1, idleDays(g) / threshold);
+  const renderCard = (g, mode) => {
+    const wish = mode === "wish";
+    const sale = mode === true;
+    const level = wish ? 0 : Math.min(1, idleDays(g) / threshold);
     const isOpen = open === g.id;
     const showArt = art[g.id] && !broken[g.id];
     const p = g.prices || {};
@@ -1138,11 +1233,15 @@ function App() {
           <div className="row">
             <button className="name" aria-expanded={isOpen} onClick={() => setOpen(isOpen ? null : g.id)}>
               <b>{g.name}{g.edition ? <small> ({g.edition})</small> : g.bgg?.year ? <small> ({g.bgg.year})</small> : null}</b>
-              <span>{idleLabel(g)}{sale ? `, ${g.condition.toLowerCase()}` : ""}</span>
+              <span>{wish ? wishLine(g) : idleLabel(g)}{sale ? `, ${g.condition.toLowerCase()}` : ""}</span>
             </button>
-            <button className={`played ${justPlayed === g.id ? "done" : ""}`} onClick={() => logPlay(g)}>
-              {justPlayed === g.id ? "Logged" : "Played"}
-            </button>
+            {wish ? (
+              <button className="played" onClick={() => bought(g)}>Bought it</button>
+            ) : (
+              <button className={`played ${justPlayed === g.id ? "done" : ""}`} onClick={() => logPlay(g)}>
+                {justPlayed === g.id ? "Logged" : "Played"}
+              </button>
+            )}
           </div>
           {sale && (p.garage || p.marketplace) ? (
             <div className="price">
@@ -1152,38 +1251,23 @@ function App() {
           ) : sale && !isOpen ? (
             <p className="note">No prices yet. Tap the name to check eBay and set them.</p>
           ) : null}
-          {isOpen && <Detail g={g} upd={upd} logPlay={logPlay} remove={remove} artApi={{ hasArt: !!art[g.id], broken: !!broken[g.id], setPhoto, setArtUrl, clearArt }} checkTitle={checkTitles} checking={checking} />}
+          {isOpen && <Detail g={g} upd={upd} logPlay={logPlay} remove={remove} artApi={{ hasArt: !!art[g.id], broken: !!broken[g.id], setPhoto, setArtUrl, clearArt }} checkTitle={checkTitles} checking={checking} onBought={bought} />}
         </div>
       </div>
     );
   };
 
-  if (!loaded) return <div className="bg"><div className="app"><style>{css}</style><p className="sub">Loading your shelf…</p></div></div>;
-
-  return (
-    <div className="bg">
-      <div className="app">
-        <style>{css}</style>
-        <h1>Game shelf</h1>
-        <p className="sub">
-          {owned.length} game{owned.length === 1 ? "" : "s"} owned. {dusty.length} haven't been played in {data.dustMonths} months.
-          {syncLine && <><br /><button className="x" style={{ padding: 0, color: sync.state === "error" ? "var(--tag)" : "var(--muted)", fontWeight: 600, fontSize: 14 }} onClick={() => runSync()}>{syncLine}</button></>}
-        </p>
-
-        <div className="tabs" role="tablist">
-          <button className="tab" role="tab" aria-selected={tab === "shelf"} onClick={() => setTab("shelf")}>Shelf</button>
-          <button className="tab" role="tab" aria-selected={tab === "dust"} onClick={() => setTab("dust")}>Not getting played ({dusty.length})</button>
-        </div>
-
-        {msg && <div className="msg" role="status">{msg} <button className="x" onClick={() => setMsg("")}>Dismiss</button></div>}
-
-        {tab === "shelf" && (
-          <>
-            {reviews.length > 0 && (
+  const scannerEl = (
+    <Scanner games={owned} wishes={wishes} onClose={() => setScanning(false)} onAdd={addFromScan} onAddWish={addWishFromScan}
+      onBought={bought} onOpen={openGame} logPlay={logPlay} onLink={linkScan} />
+  );
+  const renderReviews = (list) => (
+    <>
+            {list.length > 0 && (
               <>
-                <h2>Confirm {reviews.length} title{reviews.length === 1 ? "" : "s"}</h2>
+                <h2>Confirm {list.length} title{list.length === 1 ? "" : "s"}</h2>
                 <div className="list" style={{ marginBottom: 18 }}>
-                  {reviews.map((g) => (
+                  {list.map((g) => (
                     <div className="review" key={g.id}>
                       <p>You entered <b>{g.name}</b></p>
                       {[g.review.match, ...(g.review.alternatives || [])].filter(Boolean).map((m, i) => (
@@ -1198,6 +1282,32 @@ function App() {
                 </div>
               </>
             )}
+    </>
+  );
+
+  if (!loaded) return <div className="bg"><div className="app"><style>{css}</style><p className="sub">Loading your shelf…</p></div></div>;
+
+  return (
+    <div className="bg">
+      <div className="app">
+        <style>{css}</style>
+        <h1>Game shelf</h1>
+        <p className="sub">
+          {owned.length} game{owned.length === 1 ? "" : "s"} owned. {dusty.length} haven't been played in {data.dustMonths} months.{wishes.length ? ` ${wishes.length} on the wish list.` : ""}
+          {syncLine && <><br /><button className="x" style={{ padding: 0, color: sync.state === "error" ? "var(--tag)" : "var(--muted)", fontWeight: 600, fontSize: 14 }} onClick={() => runSync()}>{syncLine}</button></>}
+        </p>
+
+        <div className="tabs" role="tablist">
+          <button className="tab" role="tab" aria-selected={tab === "shelf"} onClick={() => { setTab("shelf"); setScanning(false); }}>Shelf</button>
+          <button className="tab" role="tab" aria-selected={tab === "dust"} onClick={() => { setTab("dust"); setScanning(false); }}>Unplayed ({dusty.length})</button>
+          <button className="tab" role="tab" aria-selected={tab === "wish"} onClick={() => { setTab("wish"); setScanning(false); }}>Wish list ({wishes.length})</button>
+        </div>
+
+        {msg && <div className="msg" role="status">{msg} <button className="x" onClick={() => setMsg("")}>Dismiss</button></div>}
+
+        {tab === "shelf" && (
+          <>
+            {renderReviews(reviews)}
 
             {adding ? (
               <div className="sheet">
@@ -1235,7 +1345,7 @@ function App() {
                 </div>
               </div>
             ) : scanning ? (
-              <Scanner games={owned} onClose={() => setScanning(false)} onAdd={addFromScan} onOpen={openGame} logPlay={logPlay} onLink={linkScan} />
+              scannerEl
             ) : (
               <>
                 <div className="bar">
@@ -1371,6 +1481,40 @@ function App() {
                 </ul>
               </>
             )}
+          </>
+        )}
+
+        {tab === "wish" && (
+          <>
+            {renderReviews(wishReviews)}
+            {scanning ? scannerEl : (
+              <>
+                <button className="btn felt" style={{ width: "100%", marginBottom: 12 }} onClick={() => setScanning(true)}>Scan a box</button>
+                <div className="sheet">
+                  <label className="f">Add a game you want
+                    <input value={wishName} onChange={(e) => setWishName(e.target.value)} onKeyDown={(e) => e.key === "Enter" && addWish()} placeholder="Game name" />
+                  </label>
+                  <div className="bar" style={{ margin: 0 }}>
+                    <select value={wishPriority} onChange={(e) => setWishPriority(e.target.value)} aria-label="Priority">
+                      {PRIORITIES.map((v) => <option key={v}>{v}</option>)}
+                    </select>
+                    <button className="btn" disabled={!wishName.trim()} onClick={addWish}>Add</button>
+                  </div>
+                </div>
+              </>
+            )}
+            {wishes.length === 0 ? (
+              <div className="empty">Nothing on the wish list yet. Add a game above, or scan a box at the store.</div>
+            ) : (
+              <div className="list">{wishes.map((g) => renderCard(g, "wish"))}</div>
+            )}
+            {wishes.length > 0 && (
+              <>
+                <button className="btn ghost" style={{ marginTop: 12 }} onClick={copyWishes}>Copy wish list</button>
+                <p className="hint">Handy to text to family before birthdays and holidays. BGG links are included.</p>
+              </>
+            )}
+            {wishText && <textarea readOnly value={wishText} onFocus={(e) => e.target.select()} />}
           </>
         )}
 
