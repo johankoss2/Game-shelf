@@ -58,11 +58,11 @@ window.addEventListener("error", function (e) {
 <script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.28.4/babel.min.js"></script>
 </head>
 <body>
-<div id="root"><p id="boot">Loading your shelf… (version 1.0)</p></div>
+<div id="root"><p id="boot">Loading your shelf… (version 1.1)</p></div>
 <script type="text/babel" data-presets="react">
 const { useState, useEffect, useMemo, useRef } = React;
 
-const APP_VERSION = "1.0";
+const APP_VERSION = "1.1";
 const KEY = "boardgame-shelf-v1";
 const ART_KEY = "boardgame-art-v1";
 const SYNC_KEY = "boardgame-sync-v1";
@@ -120,6 +120,12 @@ const EDITIONS = ["1st edition", "2nd edition", "3rd edition", "Revised edition"
 const bggViaGoogle = (name) => webSearch(`"${name}" board game site:boardgamegeek.com/boardgame`);
 
 // Rule of thumb from an eBay sold price (eBay buyers also pay shipping; local buyers expect a deal)
+// Rule of thumb from MSRP and condition (Marketplace share of MSRP; garage sale about 60% of that)
+const MSRP_FACTOR = { "Sealed": 0.7, "Like new": 0.55, "Good": 0.45, "Well-loved": 0.3 };
+const suggestFromMsrp = (msrp, cond) => {
+  const f = MSRP_FACTOR[cond] ?? 0.45;
+  return { marketplace: Math.max(1, Math.round(msrp * f)), garage: Math.max(1, Math.round(msrp * f * 0.6)) };
+};
 const suggestFrom = (ebay) => ({ garage: Math.max(1, Math.round(ebay * 0.4)), marketplace: Math.max(1, Math.round(ebay * 0.65)) });
 
 // Older data (from the Claude version) used AI estimate ranges; convert to single prices
@@ -807,6 +813,7 @@ function Detail({ g, upd, logPlay, remove, artApi, checkTitle, checking, onBough
   const p = g.prices || {};
   const setPrice = (k, v) => upd(g.id, (x) => ({ ...x, prices: { ...(x.prices || {}), [k]: v === "" ? null : Number(v) } }));
   const sugg = p.ebay ? suggestFrom(p.ebay) : null;
+  const msrpSugg = g.msrp ? suggestFromMsrp(g.msrp, g.condition) : null;
   const money = (v) => v.replace(/[^0-9.]/g, "");
 
   // ---- pieces ----
@@ -926,15 +933,32 @@ function Detail({ g, upd, logPlay, remove, artApi, checkTitle, checking, onBough
           <input type="date" value={g.ownedSince} onChange={(e) => e.target.value && upd(g.id, (x) => ({ ...x, ownedSince: e.target.value }))} />
         </label>
       </div>
-      <label className="check">
-        <input type="checkbox" checked={!!g.keep} onChange={(e) => upd(g.id, (x) => ({ ...x, keep: e.target.checked }))} />
-        Keeper (never suggest selling this one)
-      </label>
     </>
+  );
+
+  const keeperBox = (
+    <label className="check">
+      <input type="checkbox" checked={!!g.keep} onChange={(e) => upd(g.id, (x) => ({ ...x, keep: e.target.checked }))} />
+      Keeper (never suggest selling this one)
+    </label>
   );
 
   const sellingBody = (
     <div style={{ display: "grid", gap: 16 }}>
+      <div>
+        <label className="f">MSRP
+          <div className="bar" style={{ margin: 0 }}>
+            <input inputMode="decimal" placeholder="$" value={g.msrp ?? ""} onChange={(e) => { const v = money(e.target.value); upd(g.id, (x) => ({ ...x, msrp: v === "" ? null : Number(v) })); }} />
+            <a className="btn ghost" href={msrpSearch(fullName(g))} target="_blank" rel="noreferrer">Look up MSRP</a>
+          </div>
+        </label>
+        {msrpSugg && (msrpSugg.garage !== p.garage || msrpSugg.marketplace !== p.marketplace) && (
+          <button className="btn ghost" style={{ marginTop: 8 }} onClick={() => upd(g.id, (x) => ({ ...x, prices: { ...(x.prices || {}), ...msrpSugg } }))}>
+            Estimate from MSRP: ${msrpSugg.garage} garage, ${msrpSugg.marketplace} Marketplace
+          </button>
+        )}
+        <p className="hint" style={{ marginBottom: 0 }}>Estimates use the game's condition ({g.condition.toLowerCase()}): Marketplace at about {Math.round((MSRP_FACTOR[g.condition] ?? 0.45) * 100)}% of MSRP, garage sale a bit lower. An eBay sold price below is a better guide when you have one.</p>
+      </div>
       <div>
         <div className="bar" style={{ margin: "0 0 10px", flexWrap: "wrap" }}>
           <a className="btn ghost" href={ebaySold(fullName(g))} target="_blank" rel="noreferrer">eBay sold prices</a>
@@ -953,7 +977,7 @@ function Detail({ g, upd, logPlay, remove, artApi, checkTitle, checking, onBough
         </div>
         {sugg && (sugg.garage !== p.garage || sugg.marketplace !== p.marketplace) && (
           <button className="btn ghost" style={{ marginTop: 8 }} onClick={() => upd(g.id, (x) => ({ ...x, prices: { ...x.prices, ...sugg } }))}>
-            Fill in ${sugg.garage} garage, ${sugg.marketplace} Marketplace
+            Estimate from eBay: ${sugg.garage} garage, ${sugg.marketplace} Marketplace
           </button>
         )}
         <p className="hint" style={{ marginBottom: 0 }}>Enter a typical recent eBay sale. The fill-in button uses a rule of thumb: about 40% of eBay for a garage sale and 65% for Marketplace. Adjust to taste.</p>
@@ -1012,6 +1036,7 @@ function Detail({ g, upd, logPlay, remove, artApi, checkTitle, checking, onBough
       {isWish ? wishFields : (
         <>
           {logRow}
+          {keeperBox}
           {openSelling && (
             <div className="sellbox">
               <label className="f" style={{ marginBottom: 8 }}>Selling</label>
