@@ -102,7 +102,19 @@ const webSearch = (q) => `https://www.google.com/search?q=${enc(q)}`;
 const fullName = (g) => (g.edition ? `${g.name} ${g.edition}` : g.name);
 const PRIORITIES = ["Must have", "Want", "Maybe"];
 const shopSearch = (name) => `https://www.google.com/search?tbm=shop&q=${enc(name + " board game")}`;
-const wishLine = (g) => [g.priority || "Want", g.maxPrice ? `would pay up to $${g.maxPrice}` : null].filter(Boolean).join(", ");
+const wishLine = (g) => [g.priority || "Want", g.msrp ? `MSRP $${g.msrp}` : null, g.maxPrice ? `would pay up to $${g.maxPrice}` : null].filter(Boolean).join(", ");
+const msrpSearch = (name) => webSearch(`${name} board game MSRP`);
+// Compares a store price to MSRP and the price limit, e.g. "25% off MSRP, within your limit"
+const priceVerdict = (g, price) => {
+  if (!price) return "";
+  const parts = [];
+  if (g.msrp) {
+    const pct = Math.round((1 - price / g.msrp) * 100);
+    parts.push(pct > 0 ? `${pct}% off MSRP` : pct < 0 ? `${-pct}% over MSRP` : "right at MSRP");
+  }
+  if (g.maxPrice) parts.push(price <= g.maxPrice ? "within your limit" : `$${Math.round((price - g.maxPrice) * 100) / 100} over your limit`);
+  return parts.join(", ");
+};
 const EDITIONS = ["1st edition", "2nd edition", "3rd edition", "Revised edition", "Anniversary edition", "Big box", "Deluxe edition", "Collector's edition"];
 const bggViaGoogle = (name) => webSearch(`"${name}" board game site:boardgamegeek.com/boardgame`);
 
@@ -440,6 +452,10 @@ button.pick{text-align:left;color:var(--ink);cursor:pointer;width:100%;font-fami
 .pick span{flex:1}
 .pick em{font-style:normal;font-size:12.5px;color:var(--muted);white-space:nowrap}
 .name b small{font-weight:400;color:var(--muted);font-size:14px}
+details.more{margin:0;color:var(--ink);font-size:15px;border:1.5px solid var(--line);border-radius:8px;padding:10px 12px;background:var(--paper)}
+details.more summary{font-weight:700;cursor:pointer}
+details.more summary small{font-weight:400;color:var(--muted)}
+details.more[open] summary{margin-bottom:10px}
 .msg{background:#FFF4D6;border-left:4px solid var(--meeple);padding:10px 12px;border-radius:6px;margin-bottom:12px;font-size:15px}
 .empty{text-align:center;padding:36px 16px;color:var(--muted)}
 .sheet{background:var(--card);border:2px solid var(--ink);border-radius:12px;padding:14px;display:grid;gap:10px;margin-bottom:14px}
@@ -494,11 +510,12 @@ function Scanner({ games, wishes, onClose, onAdd, onAddWish, onBought, onOpen, l
   const [options, setOptions] = useState([]);
   const [searchTerms, setSearchTerms] = useState("");
   const [note, setNote] = useState("");
+  const [storePrice, setStorePrice] = useState("");
 
   const ownedMatch = (gm) => gm && games.find((g) => (gm.bggId && String(g.bgg?.id) === gm.bggId) || norm(g.name) === norm(gm.name));
   const wishMatch = (gm) => gm && wishes.find((g) => (gm.bggId && String(g.bgg?.id) === gm.bggId) || norm(g.name) === norm(gm.name));
   const linkAny = (gm, c) => { const hit = ownedMatch(gm) || wishMatch(gm); if (hit) onLink(hit.id, c, gm); };
-  const reset = () => { setStage("idle"); setErr(""); setName(""); setManual(""); setCode(""); setGame(null); setOptions([]); setSearchTerms(""); setNote(""); };
+  const reset = () => { setStorePrice(""); setStage("idle"); setErr(""); setName(""); setManual(""); setCode(""); setGame(null); setOptions([]); setSearchTerms(""); setNote(""); };
   const liveDone = useRef(false);
 
   const showGame = (gm) => {
@@ -647,8 +664,16 @@ function Scanner({ games, wishes, onClose, onAdd, onAddWish, onBought, onOpen, l
   );
   const onWish = (g) => (
     <>
-      <p style={{ margin: 0 }}>On your wish list: {wishLine(g).toLowerCase()}.</p>
+      <p style={{ margin: 0 }}>On your wish list: {wishLine(g).replace("MSRP", "msrp").toLowerCase().replace("msrp", "MSRP")}.</p>
       {g.note && <p className="hint" style={{ margin: 0 }}>{g.note}</p>}
+      <label className="f">Price on the shelf
+        <input inputMode="decimal" placeholder="$" value={storePrice} onChange={(e) => setStorePrice(e.target.value.replace(/[^0-9.]/g, ""))} />
+      </label>
+      {Number(storePrice) > 0 && (g.msrp || g.maxPrice) ? (
+        <p style={{ margin: 0, fontWeight: 700, color: g.maxPrice && Number(storePrice) > g.maxPrice ? "var(--tag)" : "var(--felt)" }}>
+          {priceVerdict(g, Number(storePrice))}
+        </p>
+      ) : Number(storePrice) > 0 ? <p className="hint" style={{ margin: 0 }}>Add an MSRP or a price limit to this game to compare.</p> : null}
       <div className="bar" style={{ margin: 0, flexWrap: "wrap" }}>
         <button className="btn felt" onClick={() => { onBought(g); onClose(); }}>We bought it</button>
         <button className="btn ghost" onClick={() => onOpen(g.id)}>Open it</button>
@@ -761,13 +786,14 @@ function Scanner({ games, wishes, onClose, onAdd, onAddWish, onBought, onOpen, l
   );
 }
 
-function Detail({ g, upd, logPlay, remove, artApi, checkTitle, checking, onBought }) {
+function Detail({ g, upd, logPlay, remove, artApi, checkTitle, checking, onBought, openSelling }) {
   const isWish = g.status === "wish";
   const [pastDate, setPastDate] = useState(today());
   const [soldFor, setSoldFor] = useState("");
   const [bggLink, setBggLink] = useState("");
   const [imgLink, setImgLink] = useState("");
   const [bggQuery, setBggQuery] = useState(g.name);
+  const [copied, setCopied] = useState("");
   const plays = [...g.plays].sort((a, b) => b.date.localeCompare(a.date));
   const { hasArt, broken, setPhoto, setArtUrl, clearArt } = artApi;
   const p = g.prices || {};
@@ -792,9 +818,14 @@ function Detail({ g, upd, logPlay, remove, artApi, checkTitle, checking, onBough
           <>
           <div className="bar" style={{ margin: "6px 0 0", flexWrap: "wrap" }}>
             <a className="btn ghost" href={bggUrl(g.bgg, g.name)} target="_blank" rel="noreferrer">Open on BGG</a>
-            <a className="btn ghost" href={bggUrl(g.bgg, g.name, true)} target="_blank" rel="noreferrer">Open in browser</a>
+            <button className="btn ghost" onClick={async () => {
+              const link = bggUrl(g.bgg, g.name);
+              try { await navigator.clipboard.writeText(link); setCopied("yes"); } catch (e) { setCopied(link); }
+              setTimeout(() => setCopied(""), 2500);
+            }}>{copied === "yes" ? "Copied!" : "Copy link"}</button>
             <button className="x" onClick={() => upd(g.id, (x) => ({ ...x, bgg: undefined, bggNone: true }))}>Unlink</button>
           </div>
+          {copied && copied !== "yes" && <input readOnly value={copied} onFocus={(e) => e.target.select()} style={{ marginTop: 8 }} aria-label="BGG link" />}
           <p className="hint">Own a different edition with its own BGG page? Tap Unlink, then search for it and paste that page's link.</p>
           </>
         ) : (
@@ -820,8 +851,8 @@ function Detail({ g, upd, logPlay, remove, artApi, checkTitle, checking, onBough
         )}
       </div>
 
-      <div>
-        <label className="f">Box art</label>
+      <details className="more">
+        <summary>Box art <small>{hasArt ? (broken ? "(link not loading)" : "(set)") : "(none yet)"}</small></summary>
         <div className="bar" style={{ margin: "6px 0 0", flexWrap: "wrap" }}>
           <label className="btn ghost filebtn">
             {hasArt ? "Replace with photo" : "Take a photo"}
@@ -835,7 +866,7 @@ function Detail({ g, upd, logPlay, remove, artApi, checkTitle, checking, onBough
           <button className="btn ghost" disabled={!/^https:\/\//.test(imgLink)} onClick={() => { setArtUrl(g.id, imgLink); setImgLink(""); }}>Save</button>
         </div>
         <p className="hint">On the BGG page, long-press the box image, choose Open in New Tab, then copy that tab's address.</p>
-      </div>
+      </details>
 
       {isWish && (
         <>
@@ -848,6 +879,15 @@ function Detail({ g, upd, logPlay, remove, artApi, checkTitle, checking, onBough
             <label className="f">Would pay up to
               <input inputMode="decimal" placeholder="$" value={g.maxPrice ?? ""} onChange={(e) => { const v = e.target.value.replace(/[^0-9.]/g, ""); upd(g.id, (x) => ({ ...x, maxPrice: v === "" ? null : Number(v) })); }} />
             </label>
+          </div>
+          <div>
+            <label className="f">MSRP
+              <div className="bar" style={{ margin: 0 }}>
+                <input inputMode="decimal" placeholder="$" value={g.msrp ?? ""} onChange={(e) => { const v = e.target.value.replace(/[^0-9.]/g, ""); upd(g.id, (x) => ({ ...x, msrp: v === "" ? null : Number(v) })); }} />
+                <a className="btn ghost" href={msrpSearch(fullName(g))} target="_blank" rel="noreferrer">Look up MSRP</a>
+              </div>
+            </label>
+            {g.msrp && g.maxPrice ? <p className="hint" style={{ marginBottom: 0 }}>Your limit is {Math.round((1 - g.maxPrice / g.msrp) * 100)}% off MSRP.</p> : null}
           </div>
           <label className="f">Notes
             <input value={g.note || ""} placeholder="Who wants it, why, where you saw it" onChange={(e) => upd(g.id, (x) => ({ ...x, note: e.target.value }))} />
@@ -862,31 +902,6 @@ function Detail({ g, upd, logPlay, remove, artApi, checkTitle, checking, onBough
 
       {!isWish && (
       <>
-      <div>
-        <label className="f">Prices</label>
-        <div className="bar" style={{ margin: "6px 0 10px", flexWrap: "wrap" }}>
-          <a className="btn ghost" href={ebaySold(fullName(g))} target="_blank" rel="noreferrer">eBay sold prices</a>
-          <a className="btn ghost" href={fbSearch(fullName(g))} target="_blank" rel="noreferrer">Marketplace listings</a>
-        </div>
-        <div className="three">
-          <label className="f">eBay sold
-            <input inputMode="decimal" placeholder="$" value={p.ebay ?? ""} onChange={(e) => setPrice("ebay", e.target.value.replace(/[^0-9.]/g, ""))} />
-          </label>
-          <label className="f">Garage sale
-            <input inputMode="decimal" placeholder="$" value={p.garage ?? ""} onChange={(e) => setPrice("garage", e.target.value.replace(/[^0-9.]/g, ""))} />
-          </label>
-          <label className="f">Marketplace
-            <input inputMode="decimal" placeholder="$" value={p.marketplace ?? ""} onChange={(e) => setPrice("marketplace", e.target.value.replace(/[^0-9.]/g, ""))} />
-          </label>
-        </div>
-        {sugg && (sugg.garage !== p.garage || sugg.marketplace !== p.marketplace) && (
-          <button className="btn ghost" style={{ marginTop: 8 }} onClick={() => upd(g.id, (x) => ({ ...x, prices: { ...x.prices, ...sugg } }))}>
-            Fill in ${sugg.garage} garage, ${sugg.marketplace} Marketplace
-          </button>
-        )}
-        <p className="hint">Look at a few recent eBay sales and enter a typical one. The fill-in button uses a rule of thumb: about 40% of eBay for a garage sale and 65% for Marketplace, since local buyers skip shipping and expect a deal. Adjust to taste.</p>
-      </div>
-
       <div className="two">
         <label className="f">Condition
           <select value={g.condition} onChange={(e) => upd(g.id, (x) => ({ ...x, condition: e.target.value }))}>
@@ -922,6 +937,33 @@ function Detail({ g, upd, logPlay, remove, artApi, checkTitle, checking, onBough
         <p className="hint" style={{ marginBottom: 0 }}>{g.plays.length} play{g.plays.length === 1 ? "" : "s"} logged</p>
       </div>
 
+      <details className="more" open={!!openSelling}>
+        <summary>Selling <small>{g.prices && (g.prices.garage || g.prices.marketplace) ? `($${g.prices.marketplace || g.prices.garage} set)` : "(prices, mark sold)"}</small></summary>
+        <div style={{ display: "grid", gap: 16 }}>
+      <div>
+        <label className="f">Prices</label>
+        <div className="bar" style={{ margin: "6px 0 10px", flexWrap: "wrap" }}>
+          <a className="btn ghost" href={ebaySold(fullName(g))} target="_blank" rel="noreferrer">eBay sold prices</a>
+          <a className="btn ghost" href={fbSearch(fullName(g))} target="_blank" rel="noreferrer">Marketplace listings</a>
+        </div>
+        <div className="three">
+          <label className="f">eBay sold
+            <input inputMode="decimal" placeholder="$" value={p.ebay ?? ""} onChange={(e) => setPrice("ebay", e.target.value.replace(/[^0-9.]/g, ""))} />
+          </label>
+          <label className="f">Garage sale
+            <input inputMode="decimal" placeholder="$" value={p.garage ?? ""} onChange={(e) => setPrice("garage", e.target.value.replace(/[^0-9.]/g, ""))} />
+          </label>
+          <label className="f">Marketplace
+            <input inputMode="decimal" placeholder="$" value={p.marketplace ?? ""} onChange={(e) => setPrice("marketplace", e.target.value.replace(/[^0-9.]/g, ""))} />
+          </label>
+        </div>
+        {sugg && (sugg.garage !== p.garage || sugg.marketplace !== p.marketplace) && (
+          <button className="btn ghost" style={{ marginTop: 8 }} onClick={() => upd(g.id, (x) => ({ ...x, prices: { ...x.prices, ...sugg } }))}>
+            Fill in ${sugg.garage} garage, ${sugg.marketplace} Marketplace
+          </button>
+        )}
+        <p className="hint">Look at a few recent eBay sales and enter a typical one. The fill-in button uses a rule of thumb: about 40% of eBay for a garage sale and 65% for Marketplace, since local buyers skip shipping and expect a deal. Adjust to taste.</p>
+      </div>
       <div>
         <label className="f">Sold it? Record the price</label>
         <div className="bar" style={{ marginTop: 4 }}>
@@ -929,6 +971,8 @@ function Detail({ g, upd, logPlay, remove, artApi, checkTitle, checking, onBough
           <button className="btn tag" onClick={() => upd(g.id, (x) => ({ ...x, status: "sold", soldFor: Number(soldFor) || 0, soldOn: today() }))}>Mark sold</button>
         </div>
       </div>
+        </div>
+      </details>
       </>
       )}
       <button className="x" style={{ justifySelf: "start", padding: 0 }} onClick={() => remove(g)}>{isWish ? "Remove from wish list" : "Delete game from shelf"}</button>
@@ -1249,7 +1293,7 @@ function App() {
   const copyWishes = async () => {
     const text = "Our board game wish list\n\n" + PRIORITIES.map((p) => {
       const items = wishes.filter((g) => (g.priority || "Want") === p);
-      return items.length ? `${p}:\n` + items.map((g) => `- ${g.name}${g.edition ? ` (${g.edition})` : ""}${g.bgg?.id ? `  ${bggUrl(g.bgg, g.name, true)}` : ""}`).join("\n") : "";
+      return items.length ? `${p}:\n` + items.map((g) => `- ${g.name}${g.edition ? ` (${g.edition})` : ""}${g.msrp ? `, MSRP $${g.msrp}` : ""}${g.bgg?.id ? `  ${bggUrl(g.bgg, g.name, true)}` : ""}`).join("\n") : "";
     }).filter(Boolean).join("\n\n");
     try { await navigator.clipboard.writeText(text); setToast("Wish list copied"); setWishText(""); }
     catch (e) { setWishText(text); }
@@ -1318,7 +1362,7 @@ function App() {
           ) : sale && !isOpen ? (
             <p className="note">No prices yet. Tap the name to check eBay and set them.</p>
           ) : null}
-          {isOpen && <Detail g={g} upd={upd} logPlay={logPlay} remove={remove} artApi={{ hasArt: !!art[g.id], broken: !!broken[g.id], setPhoto, setArtUrl, clearArt }} checkTitle={checkTitles} checking={checking} onBought={bought} />}
+          {isOpen && <Detail g={g} upd={upd} logPlay={logPlay} remove={remove} artApi={{ hasArt: !!art[g.id], broken: !!broken[g.id], setPhoto, setArtUrl, clearArt }} checkTitle={checkTitles} checking={checking} onBought={bought} openSelling={sale} />}
         </div>
       </div>
     );
