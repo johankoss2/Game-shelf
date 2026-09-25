@@ -286,6 +286,44 @@ const loadScript = (src) =>
     s.src = src; s.onload = res; s.onerror = rej;
     document.head.appendChild(s);
   });
+const FORMATS = ["ean_13", "upc_a", "upc_e", "ean_8"];
+const DETECTOR_URLS = [
+  "https://cdn.jsdelivr.net/npm/barcode-detector@2/dist/es/pure.min.js",
+  "https://cdn.jsdelivr.net/npm/barcode-detector@2/+esm",
+  "https://cdn.jsdelivr.net/npm/barcode-detector@3/+esm",
+];
+let detectorP = null;
+function getDetector() {
+  if (!detectorP) {
+    detectorP = (async () => {
+      if ("BarcodeDetector" in window) {
+        try {
+          const f = await window.BarcodeDetector.getSupportedFormats();
+          if (f.includes("ean_13")) return new window.BarcodeDetector({ formats: FORMATS });
+        } catch (e) { /* use ZXing instead */ }
+      }
+      for (const u of DETECTOR_URLS) {
+        try {
+          const m = await import(u);
+          const BD = m.BarcodeDetector || (m.default && m.default.BarcodeDetector);
+          if (BD) return new BD({ formats: FORMATS });
+        } catch (e) { /* try the next source */ }
+      }
+      throw new Error("scanner engine didn't load");
+    })().catch((e) => { detectorP = null; throw e; });
+  }
+  return detectorP;
+}
+// Product barcodes carry a check digit; reject anything that fails it
+const validGtin = (s) => {
+  if (!/^(\d{12}|\d{13})$/.test(s)) return false;
+  const d = s.split("").map(Number);
+  const check = d.pop();
+  const sum = d.reverse().reduce((a, n, i) => a + n * (i % 2 === 0 ? 3 : 1), 0);
+  return (10 - (sum % 10)) % 10 === check;
+};
+const okCode = (v) => !!v && (/^\d{8}$/.test(v) || validGtin(v));
+
 async function ensureScanLib() {
   if (window.Html5Qrcode) return;
   bcLib = bcLib || loadScript("https://cdnjs.cloudflare.com/ajax/libs/html5-qrcode/2.3.8/html5-qrcode.min.js");
@@ -310,13 +348,17 @@ const rotated = async (file, max) => {
 };
 
 async function decodeBarcode(file) {
-  if ("BarcodeDetector" in window) {
-    try {
-      const bd = new window.BarcodeDetector({ formats: ["ean_13", "upc_a", "upc_e", "ean_8"] });
-      const r = await bd.detect(await createImageBitmap(file));
-      if (r.length) return r[0].rawValue;
-    } catch (e) { /* fall through */ }
-  }
+  try {
+    const det = await getDetector();
+    for (const f of [await downscale(file, 2000), await rotated(file, 2000), file]) {
+      if (!f) continue;
+      try {
+        const r = await det.detect(await createImageBitmap(f));
+        const hit = r.map((x) => x.rawValue).find(okCode);
+        if (hit) return hit;
+      } catch (e) { /* next version */ }
+    }
+  } catch (e) { /* fall back to the older reader */ }
   await ensureScanLib();
   let el = document.getElementById("bc-reader");
   if (!el) {
@@ -519,43 +561,65 @@ function Scanner({ games, wishes, onClose, onAdd, onAddWish, onBought, onOpen, l
     }
   };
 
-  // Live camera: keeps scanning frames until it reads a barcode
+  // Live camera: reads the middle of each frame until a valid barcode shows up
+  const videoRef = useRef(null);
   useEffect(() => {
     if (stage !== "live") return;
-    let scanner = null;
-    let cancelled = false;
+    let stream = null;
+    let stopped = false;
+    let timer = null;
     liveDone.current = false;
     (async () => {
+      let det = null;
+      try { det = await getDetector(); } catch (e) { det = null; }
+      if (stopped) return;
+      if (!det) { setErr("The scanner engine couldn't load. Check your connection, or take a photo instead."); setStage("idle"); return; }
       try {
-        await ensureScanLib();
-        if (cancelled) return;
-        scanner = new window.Html5Qrcode("live-reader", {
-          formatsToSupport: scanFormats(),
-          verbose: false,
-          experimentalFeatures: { useBarCodeDetectorIfSupported: true },
+        stream = await navigator.mediaDevices.getUserMedia({
+          audio: false,
+          video: { facingMode: { ideal: "environment" }, width: { ideal: 1920 }, height: { ideal: 1080 } },
         });
-        await scanner.start(
-          { facingMode: "environment" },
-          { fps: 12, qrbox: (w, h) => ({ width: Math.floor(w * 0.9), height: Math.max(90, Math.floor(h * 0.45)) }) },
-          (text) => {
-            if (liveDone.current) return;
-            liveDone.current = true;
-            if (navigator.vibrate) navigator.vibrate(60);
-            scanner.stop().catch(() => {}).finally(() => lookup(text));
-          },
-          () => {}
-        );
-        if (cancelled) scanner.stop().catch(() => {});
       } catch (e) {
-        if (!cancelled) {
-          setErr("The camera couldn't start. If Safari asked about camera access, allow it and try again, or take a photo instead.");
-          setStage("idle");
-        }
+        if (!stopped) { setErr("The camera couldn't start. Allow camera access for this site when asked (or in Settings, Apps, Safari, Camera), or take a photo instead."); setStage("idle"); }
+        return;
       }
+      if (stopped) { stream.getTracks().forEach((t) => t.stop()); return; }
+      const v = videoRef.current;
+      v.srcObject = stream;
+      try { await v.play(); } catch (e) { /* autoplay is allowed for muted inline video */ }
+      const canvas = document.createElement("canvas");
+      const ctx = canvas.getContext("2d", { willReadFrequently: true });
+      let n = 0;
+      const tick = async () => {
+        if (stopped || liveDone.current) return;
+        try {
+          if (v.videoWidth) {
+            n++;
+            // Mostly scan the middle band (faster, fewer misreads); every 4th frame check the whole view
+            const full = n % 4 === 0;
+            const cw = full ? v.videoWidth : Math.round(v.videoWidth * 0.9);
+            const ch = full ? v.videoHeight : Math.round(v.videoHeight * 0.5);
+            canvas.width = cw; canvas.height = ch;
+            ctx.drawImage(v, (v.videoWidth - cw) / 2, (v.videoHeight - ch) / 2, cw, ch, 0, 0, cw, ch);
+            const r = await det.detect(canvas);
+            const hit = r.map((x) => x.rawValue).find(okCode);
+            if (hit && !liveDone.current) {
+              liveDone.current = true;
+              if (navigator.vibrate) navigator.vibrate(60);
+              stream.getTracks().forEach((t) => t.stop());
+              lookup(hit);
+              return;
+            }
+          }
+        } catch (e) { /* keep trying */ }
+        timer = setTimeout(tick, 100);
+      };
+      tick();
     })();
     return () => {
-      cancelled = true;
-      try { if (scanner && scanner.isScanning) scanner.stop().catch(() => {}); } catch (e) { /* ignore */ }
+      stopped = true;
+      clearTimeout(timer);
+      if (stream) stream.getTracks().forEach((t) => t.stop());
     };
   }, [stage]);
 
@@ -618,8 +682,11 @@ function Scanner({ games, wishes, onClose, onAdd, onAddWish, onBought, onOpen, l
 
       {stage === "live" && (
         <>
-          <div id="live-reader" style={{ width: "100%", minHeight: 240, borderRadius: 8, overflow: "hidden", background: "#000" }} />
-          <p className="hint" style={{ margin: 0 }}>Point at the barcode and hold steady about 6 inches away. It scans on its own.</p>
+          <div style={{ position: "relative", width: "100%", borderRadius: 8, overflow: "hidden", background: "#000" }}>
+            <video ref={videoRef} playsInline muted autoPlay style={{ width: "100%", height: 320, objectFit: "cover", display: "block" }} />
+            <div aria-hidden="true" style={{ position: "absolute", left: "6%", right: "6%", top: "32%", bottom: "32%", border: "3px solid var(--meeple)", borderRadius: 8, boxShadow: "0 0 0 999px rgba(0,0,0,.25)" }} />
+          </div>
+          <p className="hint" style={{ margin: 0 }}>Fit the barcode inside the box, about 5 to 8 inches away, and hold steady. It scans on its own.</p>
           <button className="btn ghost" onClick={() => setStage("idle")}>Cancel</button>
         </>
       )}
