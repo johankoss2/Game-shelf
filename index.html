@@ -456,6 +456,10 @@ details.more{margin:0;color:var(--ink);font-size:15px;border:1.5px solid var(--l
 details.more summary{font-weight:700;cursor:pointer}
 details.more summary small{font-weight:400;color:var(--muted)}
 details.more[open] summary{margin-bottom:10px}
+.loc{display:inline-block;background:var(--paper);border:1px solid var(--line);border-radius:999px;padding:0 8px;font-size:12.5px;color:var(--ink);margin-left:6px;line-height:1.6}
+.chips{display:flex;gap:6px;flex-wrap:wrap;margin:-4px 0 12px}
+.chip{border:1.5px solid var(--line);background:transparent;border-radius:999px;padding:5px 12px;font:600 13.5px Figtree,sans-serif;color:var(--ink)}
+.chip[aria-pressed=true]{background:var(--ink);color:var(--paper);border-color:var(--ink)}
 .msg{background:#FFF4D6;border-left:4px solid var(--meeple);padding:10px 12px;border-radius:6px;margin-bottom:12px;font-size:15px}
 .empty{text-align:center;padding:36px 16px;color:var(--muted)}
 .sheet{background:var(--card);border:2px solid var(--ink);border-radius:12px;padding:14px;display:grid;gap:10px;margin-bottom:14px}
@@ -786,7 +790,7 @@ function Scanner({ games, wishes, onClose, onAdd, onAddWish, onBought, onOpen, l
   );
 }
 
-function Detail({ g, upd, logPlay, remove, artApi, checkTitle, checking, onBought, openSelling }) {
+function Detail({ g, upd, logPlay, remove, artApi, checkTitle, checking, onBought, openSelling, locations = [] }) {
   const isWish = g.status === "wish";
   const [pastDate, setPastDate] = useState(today());
   const [soldFor, setSoldFor] = useState("");
@@ -902,6 +906,10 @@ function Detail({ g, upd, logPlay, remove, artApi, checkTitle, checking, onBough
 
       {!isWish && (
       <>
+      <label className="f">Location
+        <input list="loc-list" value={g.location || ""} placeholder="Where it lives, e.g. Basement shelf" onChange={(e) => upd(g.id, (x) => ({ ...x, location: e.target.value }))} />
+        <datalist id="loc-list">{locations.map((l) => <option key={l} value={l} />)}</datalist>
+      </label>
       <div className="two">
         <label className="f">Condition
           <select value={g.condition} onChange={(e) => upd(g.id, (x) => ({ ...x, condition: e.target.value }))}>
@@ -1005,6 +1013,7 @@ function App() {
   const [wishName, setWishName] = useState("");
   const [wishPriority, setWishPriority] = useState("Want");
   const [wishText, setWishText] = useState("");
+  const [locFilter, setLocFilter] = useState("");
   const [syncCfg, setSyncCfg] = useState(null);
   const [sync, setSync] = useState({ state: "off" });
   const [repoDraft, setRepoDraft] = useState("");
@@ -1222,15 +1231,19 @@ function App() {
   const wishes = data.games.filter((g) => g.status === "wish")
     .sort((a, b) => PRIORITIES.indexOf(a.priority || "Want") - PRIORITIES.indexOf(b.priority || "Want") || a.name.localeCompare(b.name));
   const wishReviews = wishes.filter((g) => g.review);
+  const locations = [...new Set(owned.map((g) => (g.location || "").trim()).filter(Boolean))].sort((a, b) => a.localeCompare(b));
   const sold = data.games.filter((g) => g.status === "sold");
   const dusty = owned.filter((g) => !g.keep && idleDays(g) >= threshold).sort((a, b) => idleDays(b) - idleDays(a));
   const reviews = owned.filter((g) => g.review);
   const unchecked = owned.filter((g) => !g.bgg?.id && !g.review && !g.bggNone);
   const newbies = owned.filter((g) => !g.plays.length && daysSince(g.ownedSince) < 30);
   const shelf = useMemo(() => {
-    const f = owned.filter((g) => g.name.toLowerCase().includes(q.toLowerCase()));
+    const ql = q.toLowerCase();
+    const f = owned.filter((g) =>
+      (g.name.toLowerCase().includes(ql) || (g.location || "").toLowerCase().includes(ql)) &&
+      (!locFilter || (g.location || "").trim() === locFilter));
     return sort === "name" ? f.sort((a, b) => a.name.localeCompare(b.name)) : f.sort((a, b) => idleDays(b) - idleDays(a));
-  }, [data, q, sort]);
+  }, [data, q, sort, locFilter]);
 
   const linkScan = (id, code, info) => {
     upd(id, (x) => ({
@@ -1344,7 +1357,7 @@ function App() {
           <div className="row">
             <button className="name" aria-expanded={isOpen} onClick={() => setOpen(isOpen ? null : g.id)}>
               <b>{g.name}{g.edition ? <small> ({g.edition})</small> : g.bgg?.year ? <small> ({g.bgg.year})</small> : null}</b>
-              <span>{wish ? wishLine(g) : idleLabel(g)}{sale ? `, ${g.condition.toLowerCase()}` : ""}</span>
+              <span>{wish ? wishLine(g) : idleLabel(g)}{sale ? `, ${g.condition.toLowerCase()}` : ""}{!wish && g.location ? <span className="loc">{g.location}</span> : null}</span>
             </button>
             {wish ? (
               <button className="played" onClick={() => bought(g)}>Bought it</button>
@@ -1362,7 +1375,7 @@ function App() {
           ) : sale && !isOpen ? (
             <p className="note">No prices yet. Tap the name to check eBay and set them.</p>
           ) : null}
-          {isOpen && <Detail g={g} upd={upd} logPlay={logPlay} remove={remove} artApi={{ hasArt: !!art[g.id], broken: !!broken[g.id], setPhoto, setArtUrl, clearArt }} checkTitle={checkTitles} checking={checking} onBought={bought} openSelling={sale} />}
+          {isOpen && <Detail g={g} upd={upd} logPlay={logPlay} remove={remove} artApi={{ hasArt: !!art[g.id], broken: !!broken[g.id], setPhoto, setArtUrl, clearArt }} checkTitle={checkTitles} checking={checking} onBought={bought} openSelling={sale} locations={locations} />}
         </div>
       </div>
     );
@@ -1470,6 +1483,14 @@ function App() {
                     <option value="idle">Most idle</option>
                   </select>
                 </div>
+                {locations.length > 0 && (
+                  <div className="chips" role="group" aria-label="Filter by location">
+                    <button className="chip" aria-pressed={!locFilter} onClick={() => setLocFilter("")}>All</button>
+                    {locations.map((l) => (
+                      <button key={l} className="chip" aria-pressed={locFilter === l} onClick={() => setLocFilter(locFilter === l ? "" : l)}>{l}</button>
+                    ))}
+                  </div>
+                )}
               </>
             )}
 
