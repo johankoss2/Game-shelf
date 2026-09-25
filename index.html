@@ -58,11 +58,11 @@ window.addEventListener("error", function (e) {
 <script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.28.4/babel.min.js"></script>
 </head>
 <body>
-<div id="root"><p id="boot">Loading your shelf… (version 1.4)</p></div>
+<div id="root"><p id="boot">Loading your shelf… (version 1.7)</p></div>
 <script type="text/babel" data-presets="react">
 const { useState, useEffect, useMemo, useRef } = React;
 
-const APP_VERSION = "1.4";
+const APP_VERSION = "1.7";
 const KEY = "boardgame-shelf-v1";
 const ART_KEY = "boardgame-art-v1";
 const SYNC_KEY = "boardgame-sync-v1";
@@ -828,6 +828,21 @@ function Scanner({ games, wishes, onClose, onAdd, onAddWish, onBought, onOpen, l
   );
 }
 
+class SafeDetail extends React.Component {
+  constructor(props) { super(props); this.state = { error: null }; }
+  static getDerivedStateFromError(error) { return { error }; }
+  render() {
+    if (this.state.error) {
+      return (
+        <div className="detail">
+          <p style={{ margin: 0, color: "var(--tag)" }}>This game's details hit an error: {String(this.state.error.message || this.state.error)}. The rest of the app still works. Send a screenshot of this to get it fixed.</p>
+        </div>
+      );
+    }
+    return <Detail {...this.props} />;
+  }
+}
+
 function Detail({ g, upd, logPlay, remove, artApi, checkTitle, checking, onBought, openSelling, locations = [], priceCheck, pricing }) {
   const isWish = g.status === "wish";
   const linked = !!g.bgg?.id;
@@ -979,6 +994,50 @@ function Detail({ g, upd, logPlay, remove, artApi, checkTitle, checking, onBough
     </div>
   );
 
+  const marketBox = (
+    <div>
+      <label className="f">{isWish ? "Current new price" : "New price when added"}</label>
+      {g.market?.low ? (
+        <p style={{ margin: "4px 0 0" }}><b>${g.market.low}</b> <span style={{ color: "var(--muted)", fontSize: 13.5 }}>lowest of {g.market.offers} offer{g.market.offers === 1 ? "" : "s"}{g.market.inStock ? "" : " (none in stock)"}, {new Date(g.market.at).toLocaleDateString(undefined, { month: "short", day: "numeric", year: "numeric" })}</span></p>
+      ) : g.market?.none ? (
+        <p className="hint">No offers found for this game. Enter an MSRP below to estimate from that.</p>
+      ) : g.bgg?.id ? (
+        <p className="hint">{pricing ? "Checking…" : "Not checked yet."}</p>
+      ) : (
+        <p className="hint">Link this game to BGG and its new price is captured automatically.</p>
+      )}
+      {g.bgg?.id && (
+        <div className="bar" style={{ margin: "6px 0 0", flexWrap: "wrap" }}>
+          <button className="btn ghost" disabled={pricing || fresh} onClick={() => priceCheck([g], true)}>{pricing ? "Checking…" : fresh ? "Checked recently" : "Update price"}</button>
+          {g.market?.url && <a className="btn ghost" href={g.market.url} target="_blank" rel="noreferrer">See offers</a>}
+        </div>
+      )}
+      <p className="hint" style={{ marginBottom: 0 }}>From <a href={g.market?.url || "https://boardgameprices.com"} target="_blank" rel="noreferrer">BoardGamePrices.com</a>.{isWish ? "" : " Stored with the game; only changes if you tap Update price."}</p>
+    </div>
+  );
+
+  const estimateBox = !isWish && (
+    <div>
+      <label className="f">MSRP (optional)
+        <div className="bar" style={{ margin: 0 }}>
+          <input inputMode="decimal" placeholder="$" value={g.msrp ?? ""} onChange={(e) => { const v = money(e.target.value); upd(g.id, (x) => { const n = { ...x, msrp: v === "" ? null : Number(v) }; return (x.prices || {}).manual ? n : { ...n, prices: autoPrices(n) }; }); }} />
+          <a className="btn ghost" href={msrpSearch(fullName(g))} target="_blank" rel="noreferrer">Look up MSRP</a>
+        </div>
+      </label>
+      {est ? (
+        <p style={{ margin: "8px 0 0" }}>
+          <b>Estimate for {g.condition.toLowerCase()} condition:</b> garage sale ${est.garage} ({Math.round(rateFor(g.condition).garage * 100)}%), Marketplace ${est.marketplace} ({Math.round(rateFor(g.condition).marketplace * 100)}%) of ${base} {g.msrp ? "MSRP" : "new price"}.
+        </p>
+      ) : (
+        <p className="hint" style={{ marginBottom: 0 }}>Enter an MSRP, or link the game to BGG, to get an estimate.</p>
+      )}
+      {est && p.manual && (est.garage !== p.garage || est.marketplace !== p.marketplace) ? (
+        <button className="btn ghost" style={{ marginTop: 8 }} onClick={() => upd(g.id, (x) => ({ ...x, prices: autoPrices(x) }))}>Use the estimate</button>
+      ) : null}
+      <p className="hint" style={{ marginBottom: 0 }}>Your prices below fill in from the estimate until you type your own. MSRP takes priority over the new price when both are set.</p>
+    </div>
+  );
+
   const sellingBody = (
     <div style={{ display: "grid", gap: 16 }}>
       {marketBox}
@@ -1047,50 +1106,6 @@ function Detail({ g, upd, logPlay, remove, artApi, checkTitle, checking, onBough
       </div>
       <button className="btn felt" style={{ justifySelf: "start" }} onClick={() => onBought(g)}>We bought it, move to shelf</button>
     </>
-  );
-
-  const marketBox = (
-    <div>
-      <label className="f">{isWish ? "Current new price" : "New price when added"}</label>
-      {g.market?.low ? (
-        <p style={{ margin: "4px 0 0" }}><b>${g.market.low}</b> <span style={{ color: "var(--muted)", fontSize: 13.5 }}>lowest of {g.market.offers} offer{g.market.offers === 1 ? "" : "s"}{g.market.inStock ? "" : " (none in stock)"}, {new Date(g.market.at).toLocaleDateString(undefined, { month: "short", day: "numeric", year: "numeric" })}</span></p>
-      ) : g.market?.none ? (
-        <p className="hint">No offers found for this game. Enter an MSRP below to estimate from that.</p>
-      ) : g.bgg?.id ? (
-        <p className="hint">{pricing ? "Checking…" : "Not checked yet."}</p>
-      ) : (
-        <p className="hint">Link this game to BGG and its new price is captured automatically.</p>
-      )}
-      {g.bgg?.id && (
-        <div className="bar" style={{ margin: "6px 0 0", flexWrap: "wrap" }}>
-          <button className="btn ghost" disabled={pricing || fresh} onClick={() => priceCheck([g], true)}>{pricing ? "Checking…" : fresh ? "Checked recently" : "Update price"}</button>
-          {g.market?.url && <a className="btn ghost" href={g.market.url} target="_blank" rel="noreferrer">See offers</a>}
-        </div>
-      )}
-      <p className="hint" style={{ marginBottom: 0 }}>From <a href={g.market?.url || "https://boardgameprices.com"} target="_blank" rel="noreferrer">BoardGamePrices.com</a>.{isWish ? "" : " Stored with the game; only changes if you tap Update price."}</p>
-    </div>
-  );
-
-  const estimateBox = !isWish && (
-    <div>
-      <label className="f">MSRP (optional)
-        <div className="bar" style={{ margin: 0 }}>
-          <input inputMode="decimal" placeholder="$" value={g.msrp ?? ""} onChange={(e) => { const v = money(e.target.value); upd(g.id, (x) => { const n = { ...x, msrp: v === "" ? null : Number(v) }; return (x.prices || {}).manual ? n : { ...n, prices: autoPrices(n) }; }); }} />
-          <a className="btn ghost" href={msrpSearch(fullName(g))} target="_blank" rel="noreferrer">Look up MSRP</a>
-        </div>
-      </label>
-      {est ? (
-        <p style={{ margin: "8px 0 0" }}>
-          <b>Estimate for {g.condition.toLowerCase()} condition:</b> garage sale ${est.garage} ({Math.round(rateFor(g.condition).garage * 100)}%), Marketplace ${est.marketplace} ({Math.round(rateFor(g.condition).marketplace * 100)}%) of ${base} {g.msrp ? "MSRP" : "new price"}.
-        </p>
-      ) : (
-        <p className="hint" style={{ marginBottom: 0 }}>Enter an MSRP, or link the game to BGG, to get an estimate.</p>
-      )}
-      {est && p.manual && (est.garage !== p.garage || est.marketplace !== p.marketplace) ? (
-        <button className="btn ghost" style={{ marginTop: 8 }} onClick={() => upd(g.id, (x) => ({ ...x, prices: autoPrices(x) }))}>Use the estimate</button>
-      ) : null}
-      <p className="hint" style={{ marginBottom: 0 }}>Your prices below fill in from the estimate until you type your own. MSRP takes priority over the new price when both are set.</p>
-    </div>
   );
 
   const deleteBtn = (
@@ -1569,7 +1584,7 @@ function App() {
           ) : sale && !isOpen ? (
             <p className="note">No prices yet. Tap the name to check eBay and set them.</p>
           ) : null}
-          {isOpen && <Detail g={g} upd={upd} logPlay={logPlay} remove={remove} artApi={{ hasArt: !!art[g.id], broken: !!broken[g.id], setPhoto, setArtUrl, clearArt }} checkTitle={checkTitles} checking={checking} onBought={bought} openSelling={sale} locations={locations} priceCheck={priceCheck} pricing={pricing} />}
+          {isOpen && <SafeDetail key={g.id} g={g} upd={upd} logPlay={logPlay} remove={remove} artApi={{ hasArt: !!art[g.id], broken: !!broken[g.id], setPhoto, setArtUrl, clearArt }} checkTitle={checkTitles} checking={checking} onBought={bought} openSelling={sale} locations={locations} priceCheck={priceCheck} pricing={pricing} />}
         </div>
       </div>
     );
