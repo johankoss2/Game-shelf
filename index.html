@@ -58,11 +58,11 @@ window.addEventListener("error", function (e) {
 <script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.28.4/babel.min.js"></script>
 </head>
 <body>
-<div id="root"><p id="boot">Loading your shelf… (version 2.1)</p></div>
+<div id="root"><p id="boot">Loading your shelf… (version 2.2)</p></div>
 <script type="text/babel" data-presets="react">
 const { useState, useEffect, useMemo, useRef } = React;
 
-const APP_VERSION = "2.1";
+const APP_VERSION = "2.2";
 const KEY = "boardgame-shelf-v1";
 const ART_KEY = "boardgame-art-v1";
 const SYNC_KEY = "boardgame-sync-v1";
@@ -85,6 +85,8 @@ const idleLabel = (g) => {
   const owned = daysSince(g.ownedSince);
   return owned < 1 ? "Never played, added today" : `Never played, owned since ${ago(owned)}`;
 };
+const fmtDate = (d) => (d ? new Date(d + "T12:00:00").toLocaleDateString(undefined, { month: "short", day: "numeric", year: "numeric" }) : "");
+const soldLine = (g) => `Sold${g.soldOn ? ` ${fmtDate(g.soldOn)}` : ""}${g.soldFor ? ` for $${g.soldFor}` : ""}`;
 const sameCode = (a, b) => a && b && a.replace(/^0+/, "") === b.replace(/^0+/, "");
 
 // ---------- Outside links (no keys, no accounts) ----------
@@ -498,6 +500,8 @@ details.more details.more{background:var(--card)}
 .chips{display:flex;gap:6px;flex-wrap:wrap;margin:-4px 0 12px}
 .chip{border:1.5px solid var(--line);background:transparent;border-radius:999px;padding:5px 12px;font:600 13.5px Figtree,sans-serif;color:var(--ink)}
 .chip[aria-pressed=true]{background:var(--ink);color:var(--paper);border-color:var(--ink)}
+.pager{display:flex;align-items:center;justify-content:space-between;gap:8px;margin:12px 0}
+.pager span{color:var(--muted);font-size:14px}
 .msg{background:#FFF4D6;border-left:4px solid var(--meeple);padding:10px 12px;border-radius:6px;margin-bottom:12px;font-size:15px}
 .empty{text-align:center;padding:36px 16px;color:var(--muted)}
 .sheet{background:var(--card);border:2px solid var(--ink);border-radius:12px;padding:14px;display:grid;gap:10px;margin-bottom:14px}
@@ -633,7 +637,7 @@ function PendingRow({ entry, games, onResolve }) {
   );
 }
 
-function ShelfScan({ games, wishes, locations, onClose, onAssign, onAddNew, onRelink }) {
+function ShelfScan({ games, wishes, sold = [], locations, onClose, onAssign, onAddNew, onRelink }) {
   const [loc, setLoc] = useState("");
   const [age, setAge] = useState("1");
   const [running, setRunning] = useState(false);
@@ -644,6 +648,7 @@ function ShelfScan({ games, wishes, locations, onClose, onAssign, onAddNew, onRe
   const queue = useRef(Promise.resolve());
   const gamesRef = useRef(games); gamesRef.current = games;
   const wishesRef = useRef(wishes); wishesRef.current = wishes;
+  const soldRef = useRef(sold); soldRef.current = sold;
   const locRef = useRef(loc); locRef.current = loc;
   const ageRef = useRef(age); ageRef.current = age;
 
@@ -677,6 +682,8 @@ function ShelfScan({ games, wishes, locations, onClose, onAssign, onAddNew, onRe
     if (known) { place(code, { name: known.name, bggId: known.bgg?.id }); return; }
     const w = wishesRef.current.find((g) => sameCode(g.upc, code));
     if (w) { push(code, { name: w.name, status: "On your wish list, skipped", warn: true }); return; }
+    const sd = (soldRef.current || []).find((g) => sameCode(g.upc, code));
+    if (sd) { push(code, { name: sd.name, status: `${soldLine(sd)}, skipped`, warn: true }); return; }
     push(code, { name: `Barcode ${code}`, status: "Looking up…" });
     try {
       const data = await gameUpc(code);
@@ -764,7 +771,7 @@ function ShelfScan({ games, wishes, locations, onClose, onAssign, onAddNew, onRe
   );
 }
 
-function Scanner({ games, wishes, onClose, onAdd, onAddWish, onBought, onOpen, logPlay, onLink }) {
+function Scanner({ games, wishes, sold = [], onClose, onAdd, onAddWish, onBought, onOpen, logPlay, onLink, onRestore, onStoreInBox }) {
   // idle | reading | looking | local | found | choose | manual
   const [stage, setStage] = useState("idle");
   const [code, setCode] = useState("");
@@ -794,7 +801,7 @@ function Scanner({ games, wishes, onClose, onAdd, onAddWish, onBought, onOpen, l
     const c = (raw || "").replace(/\D/g, "");
     if (c.length < 8) { setErr("That doesn't look like a full barcode number."); setStage("idle"); return; }
     setCode(c); setErr("");
-    if (games.find((g) => sameCode(g.upc, c)) || wishes.find((g) => sameCode(g.upc, c))) { setStage("local"); return; }
+    if (games.find((g) => sameCode(g.upc, c)) || wishes.find((g) => sameCode(g.upc, c)) || sold.find((g) => sameCode(g.upc, c))) { setStage("local"); return; }
     setStage("looking");
     try {
       const data = await gameUpc(c);
@@ -911,8 +918,11 @@ function Scanner({ games, wishes, onClose, onAdd, onAddWish, onBought, onOpen, l
 
   const local = code ? games.find((g) => sameCode(g.upc, code)) : null;
   const localWish = code && !local ? wishes.find((g) => sameCode(g.upc, code)) : null;
+  const localSold = code && !local && !localWish ? sold.find((g) => sameCode(g.upc, code)) : null;
   const mine = stage === "found" ? ownedMatch(game) : null;
   const wished = stage === "found" && !mine ? wishMatch(game) : null;
+  const soldMatch = stage === "found" && !mine && !wished && game
+    ? sold.find((g) => (game.bggId && String(g.bgg?.id) === game.bggId) || norm(g.name) === norm(game.name)) : null;
   const nameMatch = name.trim() ? games.find((g) => norm(g.name) === norm(name)) : null;
   const ageSelect = (
     <label className="f">When did you get it?
@@ -923,10 +933,21 @@ function Scanner({ games, wishes, onClose, onAdd, onAddWish, onBought, onOpen, l
   );
   const onShelf = (g) => (
     <>
-      <p style={{ margin: 0 }}>Already on your shelf.</p>
+      <p style={{ margin: 0 }}>{g.inBox ? `You own this. It's stored in ${g.storedIn ? `the ${g.storedIn} box` : "another box"}.` : "Already on your shelf."}</p>
       <div className="bar" style={{ margin: 0, flexWrap: "wrap" }}>
         <button className="btn felt" onClick={() => { logPlay(g); onClose(); }}>Log a play</button>
         <button className="btn ghost" onClick={() => onOpen(g.id)}>Open it</button>
+        {g.bgg?.id && <a className="btn ghost" href={bggUrl(g.bgg, g.name)} target="_blank" rel="noreferrer">View on BGG</a>}
+      </div>
+      {!g.inBox && <button className="x" style={{ justifySelf: "start", padding: 0, color: "var(--ink)" }} onClick={() => { onStoreInBox(g.id); onClose(); }}>Expansion stored in another box? Mark it</button>}
+    </>
+  );
+  const onSold = (g) => (
+    <>
+      <p style={{ margin: 0, fontWeight: 700, color: "var(--tag)" }}>You already had this one. {soldLine(g)}.</p>
+      <div className="bar" style={{ margin: 0, flexWrap: "wrap" }}>
+        <button className="btn ghost" onClick={() => { onRestore(g); onClose(); }}>Bought it back</button>
+        <button className="btn ghost" onClick={() => onAddWish({ name: g.name, bggId: g.bgg?.id }, code)}>Add to wish list</button>
         {g.bgg?.id && <a className="btn ghost" href={bggUrl(g.bgg, g.name)} target="_blank" rel="noreferrer">View on BGG</a>}
       </div>
     </>
@@ -988,10 +1009,10 @@ function Scanner({ games, wishes, onClose, onAdd, onAddWish, onBought, onOpen, l
       {stage === "reading" && <p style={{ margin: 0 }} role="status">Reading the barcode…</p>}
       {stage === "looking" && <p style={{ margin: 0 }} role="status">Looking up {code}…</p>}
 
-      {stage === "local" && (local || localWish) && (
+      {stage === "local" && (local || localWish || localSold) && (
         <>
-          <div className="pick"><b>{(local || localWish).name}</b></div>
-          {local ? onShelf(local) : onWish(localWish)}
+          <div className="pick"><b>{(local || localWish || localSold).name}</b></div>
+          {local ? onShelf(local) : localWish ? onWish(localWish) : onSold(localSold)}
           {again}
         </>
       )}
@@ -1002,12 +1023,13 @@ function Scanner({ games, wishes, onClose, onAdd, onAddWish, onBought, onOpen, l
             {game.image && <img src={game.image} alt="" style={{ width: 48, height: 48, objectFit: "contain" }} onError={(e) => (e.target.style.display = "none")} />}
             <span><b>{game.name}</b>{game.year ? ` (${game.year})` : ""}</span>
           </div>
-          {mine ? onShelf(mine) : wished ? onWish(wished) : (
+          {mine ? onShelf(mine) : wished ? onWish(wished) : soldMatch ? onSold(soldMatch) : (
             <>
               {ageSelect}
               <div className="bar" style={{ margin: 0, flexWrap: "wrap" }}>
                 <button className="btn" onClick={() => onAdd(game, code, Number(age))}>Add to shelf</button>
                 <button className="btn ghost" onClick={() => onAddWish(game, code)}>Add to wish list</button>
+                <button className="btn ghost" onClick={() => onAdd(game, code, Number(age), { inBox: true })}>Expansion in another box</button>
                 {game.bggId && <a className="btn ghost" href={bggUrl({ id: game.bggId }, game.name)} target="_blank" rel="noreferrer">View on BGG</a>}
               </div>
             </>
@@ -1122,7 +1144,7 @@ class SafeDetail extends React.Component {
   }
 }
 
-function Detail({ g, upd, logPlay, remove, artApi, checkTitle, checking, onBought, openSelling, locations = [], priceCheck, pricing, onRelink }) {
+function Detail({ g, upd, logPlay, remove, artApi, checkTitle, checking, onBought, openSelling, locations = [], priceCheck, pricing, onRelink, allGames = [] }) {
   const isWish = g.status === "wish";
   const linked = !!g.bgg?.id;
   const [pastDate, setPastDate] = useState(today());
@@ -1387,6 +1409,25 @@ function Detail({ g, upd, logPlay, remove, artApi, checkTitle, checking, onBough
     </>
   );
 
+  const storedHere = allGames.filter((x) => x.inBox && x.status !== "sold" && x.storedIn && norm(x.storedIn) === norm(g.name));
+  const boxSection = !isWish && (
+    <div>
+      <label className="check">
+        <input type="checkbox" checked={!!g.inBox} onChange={(e) => upd(g.id, (x) => ({ ...x, inBox: e.target.checked }))} />
+        Expansion stored in another box (hides it from the main list)
+      </label>
+      {g.inBox && (
+        <label className="f" style={{ marginTop: 8 }}>Stored in (optional)
+          <input list="box-games" value={g.storedIn || ""} placeholder="Base game, e.g. Agricola" onChange={(e) => upd(g.id, (x) => ({ ...x, storedIn: e.target.value }))} />
+          <datalist id="box-games">{allGames.filter((x) => x.status === "owned" && !x.inBox && x.id !== g.id).map((x) => <option key={x.id} value={x.name} />)}</datalist>
+        </label>
+      )}
+    </div>
+  );
+  const storedList = storedHere.length > 0 && (
+    <p className="hint" style={{ margin: 0 }}>Stored inside this box: {storedHere.map((x) => x.name).join(", ")}</p>
+  );
+
   const deleteBtn = (
     <button className="x" style={{ justifySelf: "start", padding: 0 }} onClick={() => remove(g)}>{isWish ? "Remove from wish list" : "Delete game from shelf"}</button>
   );
@@ -1399,6 +1440,8 @@ function Detail({ g, upd, logPlay, remove, artApi, checkTitle, checking, onBough
       {isWish ? wishFields : (
         <>
           {logRow}
+          {g.inBox && <p className="hint" style={{ margin: 0 }}>Stored in {g.storedIn ? `the ${g.storedIn} box` : "another box"}.</p>}
+          {storedList}
           {keeperBox}
           {openSelling && (
             <div className="sellbox">
@@ -1422,6 +1465,7 @@ function Detail({ g, upd, logPlay, remove, artApi, checkTitle, checking, onBough
               {sellingBody}
             </details>
           )}
+          {boxSection}
           {g.upc && onRelink && <BarcodeFix g={g} upd={upd} onRelink={onRelink} />}
           {unlinkRow}
           {deleteBtn}
@@ -1441,6 +1485,8 @@ function App() {
   const [adding, setAdding] = useState(false);
   const [scanning, setScanning] = useState(false);
   const [shelfScan, setShelfScan] = useState(false);
+  const [page, setPage] = useState(0);
+  const jumpTo = useRef(null);
   const [bulk, setBulk] = useState(false);
   const [form, setForm] = useState({ name: "", condition: "Good", ownedSince: today() });
   const [bulkText, setBulkText] = useState("");
@@ -1709,7 +1755,8 @@ function App() {
 
   const openGame = (id, tabName) => {
     const st = dataRef.current.games.find((x) => x.id === id)?.status;
-    setScanning(false); setTab(tabName || (st === "wish" ? "wish" : "shelf")); setQ(""); setOpen(id);
+    jumpTo.current = id;
+    setScanning(false); setTab(tabName || (st === "wish" ? "wish" : "shelf")); setQ(""); setLocFilter(""); setOpen(id);
     setTimeout(() => document.getElementById(`g-${id}`)?.scrollIntoView({ behavior: "smooth", block: "center" }), 120);
   };
 
@@ -1720,18 +1767,25 @@ function App() {
   const wishReviews = wishes.filter((g) => g.review);
   const locations = [...new Set(owned.map((g) => (g.location || "").trim()).filter(Boolean))].sort((a, b) => a.localeCompare(b));
   const sold = data.games.filter((g) => g.status === "sold");
+  const shelfGames = owned.filter((g) => !g.inBox);
+  const boxed = owned.filter((g) => g.inBox).sort((a, b) => a.name.localeCompare(b.name));
   const forSale = owned.filter((g) => g.forSale).sort((a, b) => a.name.localeCompare(b.name));
-  const dusty = owned.filter((g) => !g.keep && !g.forSale && idleDays(g) >= threshold).sort((a, b) => idleDays(b) - idleDays(a));
+  const dusty = shelfGames.filter((g) => !g.keep && !g.forSale && idleDays(g) >= threshold).sort((a, b) => idleDays(b) - idleDays(a));
   const reviews = owned.filter((g) => g.review);
   const unchecked = owned.filter((g) => !g.bgg?.id && !g.review && !g.bggNone);
-  const newbies = owned.filter((g) => !g.plays.length && daysSince(g.ownedSince) < 30);
+  const newbies = shelfGames.filter((g) => !g.plays.length && daysSince(g.ownedSince) < 30);
   const shelf = useMemo(() => {
     const ql = q.toLowerCase();
-    const f = owned.filter((g) =>
+    const f = shelfGames.filter((g) =>
       (g.name.toLowerCase().includes(ql) || (g.location || "").toLowerCase().includes(ql)) &&
       (!locFilter || (g.location || "").trim() === locFilter));
     return sort === "name" ? f.sort((a, b) => a.name.localeCompare(b.name)) : f.sort((a, b) => idleDays(b) - idleDays(a));
   }, [data, q, sort, locFilter]);
+  const PAGE = 10;
+  const pages = Math.max(1, Math.ceil(shelf.length / PAGE));
+  const pageNow = Math.min(page, pages - 1);
+  const shelfPage = shelf.slice(pageNow * PAGE, pageNow * PAGE + PAGE);
+  const soldHits = q.trim() ? sold.filter((g) => g.name.toLowerCase().includes(q.toLowerCase())) : [];
 
   const linkScan = (id, code, info) => {
     upd(id, (x) => ({
@@ -1741,10 +1795,11 @@ function App() {
     }));
     if (info?.image) putArt(id, info.image, true);
   };
-  const addFromScan = (info, code, years) => {
+  const addFromScan = (info, code, years, extra = {}) => {
     const match = owned.find((g) => (info.bggId && String(g.bgg?.id) === info.bggId) || norm(g.name) === norm(info.name));
     if (match) {
       linkScan(match.id, code, info);
+      if (extra.inBox) upd(match.id, (x) => ({ ...x, inBox: true }));
       setToast(`Barcode linked to ${match.name}`);
       openGame(match.id);
       return;
@@ -1752,10 +1807,11 @@ function App() {
     const g = {
       id: uid(), name: info.name, condition: "Good", ownedSince: yearsAgo(years), plays: [], keep: false, status: "owned", upc: code, updatedAt: Date.now(), addedAt: today(),
       ...(info.bggId ? { bgg: { id: info.bggId, slug: "" } } : {}),
+      ...extra,
     };
     setData((d) => ({ ...d, games: [...d.games, g] }));
     if (info.image) putArt(g.id, info.image);
-    setToast(`Added ${info.name}`);
+    setToast(extra.inBox ? `Added ${info.name} as stored in another box. Set which box under Edit details.` : `Added ${info.name}`);
     openGame(g.id);
     if (!info.bggId) checkTitles([g]);
   };
@@ -1792,6 +1848,13 @@ function App() {
     if (!info.bggId) checkTitles([{ ...data.games.find((g) => g.id === id), name: info.name, bgg: undefined }]);
   };
 
+  const restoreSold = (g) => {
+    upd(g.id, (x) => ({ ...x, status: "owned", forSale: false, addedAt: today(), ownedSince: today() }));
+    setToast(`${g.name} is back on your shelf`);
+    openGame(g.id, "shelf");
+  };
+  const storeInBox = (id) => { upd(id, (x) => ({ ...x, inBox: true })); setToast("Marked as stored in another box"); openGame(id, "shelf"); };
+
   // ---------- Wish list ----------
   const newWish = (name, extra = {}) => ({
     id: uid(), name, status: "wish", priority: wishPriority, condition: "Good", ownedSince: today(),
@@ -1802,6 +1865,8 @@ function App() {
     if (!name) return;
     const dupe = [...owned, ...wishes].find((g) => norm(g.name) === norm(name));
     if (dupe) { setToast(dupe.status === "wish" ? `${dupe.name} is already on the wish list` : `You already own ${dupe.name}`); openGame(dupe.id); return; }
+    const was = sold.find((g) => norm(g.name) === norm(name));
+    if (was && !window.confirm(`You already had ${was.name}. ${soldLine(was)}. Add it to the wish list anyway?`)) return;
     const g = newWish(name);
     setData((d) => ({ ...d, games: [...d.games, g] }));
     setWishName("");
@@ -1860,6 +1925,16 @@ function App() {
     catch (e) { setCopyText(text); }
   };
 
+  // Back to page 1 when the search, filter, or sort changes
+  useEffect(() => { setPage(0); }, [q, locFilter, sort]);
+  // When a game is opened from elsewhere (like a scan), jump to its page
+  useEffect(() => {
+    if (!jumpTo.current) return;
+    const idx = shelf.findIndex((g) => g.id === jumpTo.current);
+    if (idx >= 0) setPage(Math.floor(idx / 10));
+    jumpTo.current = null;
+  }, [shelf]);
+
   const renderCard = (g, mode) => {
     const wish = mode === "wish";
     const sale = mode === true;
@@ -1897,14 +1972,14 @@ function App() {
           ) : sale && !isOpen ? (
             <p className="note">No prices yet. Tap the name to check eBay and set them.</p>
           ) : null}
-          {isOpen && <SafeDetail key={g.id} g={g} upd={upd} logPlay={logPlay} remove={remove} artApi={{ hasArt: !!art[g.id], broken: !!broken[g.id], setPhoto, setArtUrl, clearArt }} checkTitle={checkTitles} checking={checking} onBought={bought} openSelling={sale} locations={locations} priceCheck={priceCheck} pricing={pricing} onRelink={relinkGame} />}
+          {isOpen && <SafeDetail key={g.id} g={g} upd={upd} logPlay={logPlay} remove={remove} artApi={{ hasArt: !!art[g.id], broken: !!broken[g.id], setPhoto, setArtUrl, clearArt }} checkTitle={checkTitles} checking={checking} onBought={bought} openSelling={sale} locations={locations} priceCheck={priceCheck} pricing={pricing} onRelink={relinkGame} allGames={data.games} />}
         </div>
       </div>
     );
   };
 
   const scannerEl = (
-    <Scanner games={owned} wishes={wishes} onClose={() => setScanning(false)} onAdd={addFromScan} onAddWish={addWishFromScan}
+    <Scanner games={owned} wishes={wishes} sold={sold} onRestore={restoreSold} onStoreInBox={storeInBox} onClose={() => setScanning(false)} onAdd={addFromScan} onAddWish={addWishFromScan}
       onBought={bought} onOpen={openGame} logPlay={logPlay} onLink={linkScan} />
   );
   const renderReviews = (list) => (
@@ -1939,7 +2014,7 @@ function App() {
         <style>{css}</style>
         <h1>Game shelf</h1>
         <p className="sub">
-          {owned.length} game{owned.length === 1 ? "" : "s"} owned. {dusty.length} haven't been played in {data.dustMonths} months.{wishes.length ? ` ${wishes.length} on the wish list.` : ""}
+          {shelfGames.length} game{shelfGames.length === 1 ? "" : "s"} owned{boxed.length ? ` (plus ${boxed.length} stored in other boxes)` : ""}. {dusty.length} haven't been played in {data.dustMonths} months.{wishes.length ? ` ${wishes.length} on the wish list.` : ""}
           {syncLine && <><br /><button className="x" style={{ padding: 0, color: sync.state === "error" ? "var(--tag)" : "var(--muted)", fontWeight: 600, fontSize: 14 }} onClick={() => runSync()}>{syncLine}</button></>}
         </p>
 
@@ -1994,7 +2069,7 @@ function App() {
             ) : scanning ? (
               scannerEl
             ) : shelfScan ? (
-              <ShelfScan games={owned} wishes={wishes} locations={locations} onClose={() => setShelfScan(false)} onAssign={assignLocation} onAddNew={addScannedToLocation} onRelink={relinkGame} />
+              <ShelfScan games={owned} wishes={wishes} sold={sold} locations={locations} onClose={() => setShelfScan(false)} onAssign={assignLocation} onAddNew={addScannedToLocation} onRelink={relinkGame} />
             ) : (
               <>
                 <div className="bar">
@@ -2029,7 +2104,35 @@ function App() {
             {owned.length === 0 ? (
               <div className="empty">Your shelf is empty. Scan a box, or tap Add by name and paste a list to load your whole collection at once.</div>
             ) : (
-              <div className="list">{shelf.map((g) => renderCard(g))}</div>
+              <>
+                <div className="list">{shelfPage.map((g) => renderCard(g))}</div>
+                {pages > 1 && (
+                  <div className="pager">
+                    <button className="btn ghost" disabled={pageNow === 0} onClick={() => { setPage(pageNow - 1); window.scrollTo({ top: 0, behavior: "smooth" }); }}>Previous</button>
+                    <span>Page {pageNow + 1} of {pages} ({shelf.length} games)</span>
+                    <button className="btn ghost" disabled={pageNow >= pages - 1} onClick={() => { setPage(pageNow + 1); window.scrollTo({ top: 0, behavior: "smooth" }); }}>Next</button>
+                  </div>
+                )}
+                {soldHits.length > 0 && (
+                  <div style={{ marginTop: 12 }}>
+                    <label className="f">Sold earlier</label>
+                    <ul className="plays" style={{ marginTop: 4 }}>
+                      {soldHits.map((g) => (
+                        <li key={g.id}>
+                          <span>{g.name} <span style={{ color: "var(--muted)", fontSize: 13.5 }}>{soldLine(g)}</span></span>
+                          <button className="x" onClick={() => restoreSold(g)}>Bought it back</button>
+                        </li>
+                      ))}
+                    </ul>
+                  </div>
+                )}
+                {boxed.length > 0 && (
+                  <details className="more" style={{ marginTop: 14 }} open={!!open && boxed.some((b) => b.id === open)}>
+                    <summary>Stored in other boxes <small>({boxed.length})</small></summary>
+                    <div className="list">{boxed.map((g) => renderCard(g))}</div>
+                  </details>
+                )}
+              </>
             )}
 
             <p className="credit">Title checks from <a href="https://www.wikidata.org" target="_blank" rel="noreferrer">Wikidata</a>. Barcode matches from <a href="https://gameupc.com" target="_blank" rel="noreferrer">GameUPC</a>. New prices from <a href="https://boardgameprices.com" target="_blank" rel="noreferrer">BoardGamePrices.com</a>. Game links go to <a href="https://boardgamegeek.com" target="_blank" rel="noreferrer">BoardGameGeek</a>. Saved on this phone, and synced if Shared shelf is on.<br />Game Shelf version {APP_VERSION}</p>
