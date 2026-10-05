@@ -58,11 +58,11 @@ window.addEventListener("error", function (e) {
 <script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.28.4/babel.min.js"></script>
 </head>
 <body>
-<div id="root"><p id="boot">Loading your shelf… (version 2.2)</p></div>
+<div id="root"><p id="boot">Loading your shelf… (version 2.3)</p></div>
 <script type="text/babel" data-presets="react">
 const { useState, useEffect, useMemo, useRef } = React;
 
-const APP_VERSION = "2.2";
+const APP_VERSION = "2.3";
 const KEY = "boardgame-shelf-v1";
 const ART_KEY = "boardgame-art-v1";
 const SYNC_KEY = "boardgame-sync-v1";
@@ -1919,8 +1919,11 @@ function App() {
   const soldTotal = sold.reduce((s, g) => s + (g.soldFor || 0), 0);
 
   const copyListing = async () => {
-    const lines = priced.map((g) => `${g.name}${g.edition ? ` (${g.edition})` : ""}, ${g.condition.toLowerCase()}: $${g.prices.marketplace || g.prices.garage}`);
-    const text = `Board games for sale. Pickup only, cash or Venmo. Message me with questions.\n\n${lines.join("\n")}`;
+    // Each game: title line, then its BGG link on its own line (Marketplace is plain text, so no hyperlinked titles)
+    const lines = priced.map((g) =>
+      `${g.name}${g.edition ? ` (${g.edition})` : ""}, ${g.condition.toLowerCase()}: $${g.prices.marketplace || g.prices.garage}` +
+      (g.bgg?.id ? `\n${bggUrl(g.bgg, g.name)}` : ""));
+    const text = `Board games for sale. Pickup only, cash or Venmo. Message me with questions.\n\n${lines.join("\n\n")}`;
     try { await navigator.clipboard.writeText(text); setToast("Listing copied"); setCopyText(""); }
     catch (e) { setCopyText(text); }
   };
