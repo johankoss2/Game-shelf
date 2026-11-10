@@ -62,7 +62,7 @@ window.addEventListener("error", function (e) {
 <script type="text/babel" data-presets="react">
 const { useState, useEffect, useMemo, useRef } = React;
 
-const APP_VERSION = "2.4";
+const APP_VERSION = "2.5";
 const KEY = "boardgame-shelf-v1";
 const ART_KEY = "boardgame-art-v1";
 const SYNC_KEY = "boardgame-sync-v1";
@@ -303,31 +303,56 @@ const sinceLabel = (t) => {
 // in the collection, play log or sell list.
 const PLEDGE_KEY = "boardgame-pledges-v1";
 const PLEDGE_FILE = "pledges.json";
-const PLATFORMS = ["Gamefound", "Kickstarter"];
-const PLEDGE_STATUSES = ["Pledged", "Placed", "Preparing for shipping", "Shipped", "Completed"];
+const PLATFORMS = ["Kickstarter", "Gamefound"];
+const PLEDGE_MANAGERS = ["none yet", "BackerKit", "Gamefound", "Hive", "PledgeManager", "Allplay", "Kickstarter PM"];
+// Lifecycle order, plus Ukraine (stalled, kept on record only)
+const PLEDGE_STATUSES = ["Backed", "Charged", "PM open", "PM done", "Order locked", "In production", "Shipping", "Received", "Ukraine"];
 const PLEDGE_HINT = {
-  "Pledged": "Pledge manager not done yet",
-  "Placed": "Order placed, waiting on production",
-  "Preparing for shipping": "Getting ready to ship",
-  "Shipped": "On its way",
-  "Completed": "Delivered",
+  "Backed": "campaign live, card not charged yet",
+  "Charged": "campaign over, pledge manager not open yet",
+  "PM open": "action needed: survey, add-ons, address, payment",
+  "PM done": "survey done and paid",
+  "Order locked": "order locked",
+  "In production": "being made",
+  "Shipping": "on its way",
+  "Received": "arrived",
+  "Ukraine": "stalled, not expected; left out of totals",
 };
-// Order in the waiting list: closest to arriving first
-const PLEDGE_RANK = { "Shipped": 0, "Preparing for shipping": 1, "Placed": 2, "Pledged": 3, "Completed": 4 };
-const CURRENCIES = ["USD", "EUR", "GBP", "CAD", "AUD"];
+const CURRENCIES = ["USD", "EUR", "GBP", "CAD"];
 const LONG_WAIT_YEARS = 2;
-const isLongWait = (p) => p.status !== "Completed" && !!p.orderDate && p.orderDate <= yearsAgo(LONG_WAIT_YEARS);
-const waitYears = (p) => (daysSince(p.orderDate) / 365).toFixed(1).replace(/\.0$/, "");
+// Statuses from version 2.4 (Gamefound-style) mapped onto the lifecycle
+const LEGACY_STATUS = { "Pledged": "Charged", "Placed": "In production", "Preparing for shipping": "Shipping", "Shipped": "Shipping", "Completed": "Received" };
+const isClosed = (p) => p.status === "Received" || p.status === "Ukraine";
+const num = (v) => (v === "" || v === null || v === undefined || isNaN(Number(v)) ? undefined : Number(v));
+// What the pledge costs in all: total paid if known, otherwise pledge plus extra charges
+const pledgeCost = (p) => num(p.totalPaid) ?? (num(p.pledgeAmount) || 0) + (num(p.extraCharges) || 0);
+const waitFrom = (p) => p.backedDate || p.chargeDate || "";
+const isLongWait = (p) => !isClosed(p) && !!waitFrom(p) && waitFrom(p) <= yearsAgo(LONG_WAIT_YEARS);
+const waitYears = (p) => (daysSince(waitFrom(p)) / 365).toFixed(1).replace(/\.0$/, "");
 const fmtMoney = (amt, cur) => {
   const n = Number(amt) || 0;
   try { return new Intl.NumberFormat(undefined, { style: "currency", currency: cur || "USD" }).format(n); }
   catch (e) { return `${cur || ""} ${n.toFixed(2)}`.trim(); }
 };
+const fmtMonth = (m) => (m && /^\d{4}-\d{2}$/.test(m) ? new Date(m + "-15T12:00:00").toLocaleDateString(undefined, { month: "short", year: "numeric" }) : m || "");
 // "Gang Wars (+ Scarface 1920 Reprint)" -> "Gang Wars", a better guess for the title check
 const shelfName = (n) => (n || "").replace(/\s*\([^)]*\)/g, "").replace(/\s+/g, " ").trim() || n;
+// Upgrade a record saved by version 2.4 without touching its edit time
+const normalizePledge = (p0) => {
+  const p = { ...p0 };
+  if (LEGACY_STATUS[p.status]) p.status = LEGACY_STATUS[p.status];
+  if (!PLEDGE_STATUSES.includes(p.status)) p.status = "Charged";
+  if (p.pledgeAmount === undefined && p.amount !== undefined) p.pledgeAmount = p.amount;
+  if (!p.backedDate && p.orderDate) p.backedDate = p.orderDate;
+  if (!p.receivedDate && p.deliveredOn) p.receivedDate = p.deliveredOn;
+  if (!p.pledgeManager) p.pledgeManager = p.platform === "Gamefound" ? "Gamefound" : "none yet";
+  if (p.onShelf === undefined) p.onShelf = !!p.shelfId;
+  ["amount", "orderDate", "deliveredOn", "prevStatus"].forEach((k) => delete p[k]);
+  return p;
+};
 const tidyPledges = (s) => ({
   ...(s || {}),
-  pledges: [...((s && s.pledges) || [])].sort((a, b) => (a.id < b.id ? -1 : 1)),
+  pledges: [...((s && s.pledges) || [])].map(normalizePledge).sort((a, b) => (a.id < b.id ? -1 : 1)),
   deleted: { ...((s && s.deleted) || {}) },
 });
 const canonPledges = (s) => stable(tidyPledges(s));
@@ -343,70 +368,111 @@ const mergePledges = (a, b) => {
   });
   return tidyPledges({ ...b, ...(a || {}), pledges: Object.values(byId).filter((p) => !deleted[p.id]), deleted });
 };
-// One pledge per line: Name | Pledge ID | Order date | EUR 104.00 | Status | notes (optional)
-const parsePledgeLines = (text, platform) => {
+// One pledge per line: Name | Platform | Pledge manager | Status | USD 999 | details (optional, kept as notes)
+const parsePledgeLines = (text) => {
   const ok = [], bad = [];
+  const pick = (list, v, dflt) => list.find((x) => norm(x) === norm(v)) || dflt;
   text.split("\n").map((l) => l.trim()).filter(Boolean).forEach((line) => {
     const parts = line.split("|").map((s) => s.trim());
-    if (parts.length < 4 || !parts[0]) { bad.push(line); return; }
-    const [name, pledgeId, orderDate, money, statusText = "", ...rest] = parts;
+    if (parts.length < 5 || !parts[0]) { bad.push(line); return; }
+    const [name, platform, pm, statusText, money, ...rest] = parts;
     const currency = ((money.match(/[A-Za-z]{3}/) || [])[0] || "USD").toUpperCase();
-    const amount = parseFloat(money.replace(/,/g, "").replace(/[^0-9.]/g, ""));
-    const st = statusText.toLowerCase();
-    const status = PLEDGE_STATUSES.find((s) => s.toLowerCase() === st) || (/deliver/.test(st) ? "Completed" : "Placed");
-    if (isNaN(amount) || (orderDate && !/^\d{4}-\d{2}-\d{2}$/.test(orderDate))) { bad.push(line); return; }
-    ok.push({ id: uid(), name, platform, pledgeId, status, amount, currency, orderDate: orderDate || "", estDelivery: "", notes: rest.join(" | "), updatedAt: Date.now() });
+    const pledgeAmount = parseFloat(money.replace(/,/g, "").replace(/^[^0-9]*/, ""));
+    if (isNaN(pledgeAmount)) { bad.push(line); return; }
+    ok.push({
+      id: uid(), name, platform: pick(PLATFORMS, platform, "Kickstarter"),
+      pledgeManager: /^none/i.test(pm) ? "none yet" : pick(PLEDGE_MANAGERS, pm, pm || "none yet"),
+      status: pick(PLEDGE_STATUSES, statusText, LEGACY_STATUS[statusText] || "Charged"),
+      pledgeAmount, currency, notes: rest.join(" | "), onShelf: false, updatedAt: Date.now(),
+    });
   });
   return { ok, bad };
 };
 
-function PledgeEdit({ p, upd, onDelete, onShelve }) {
+function Toggle({ label, checked, onChange }) {
+  return (
+    <label className="switch" style={{ marginLeft: 0 }}>
+      <input type="checkbox" role="switch" checked={!!checked} onChange={(e) => onChange(e.target.checked)} />
+      <span>{label}</span>
+    </label>
+  );
+}
+
+function PledgeEdit({ p, upd, onDelete, onShelve, owned }) {
   const set = (k) => (e) => upd(p.id, (x) => ({ ...x, [k]: e.target.value }));
+  const setNum = (k) => (e) => { const v = parseFloat(e.target.value.replace(/,/g, "")); upd(p.id, (x) => ({ ...x, [k]: isNaN(v) ? undefined : v })); };
+  const setStatus = (e) => {
+    const st = e.target.value;
+    upd(p.id, (x) => ({ ...x, status: st, receivedDate: st === "Received" ? x.receivedDate || today() : undefined }));
+  };
+  const linked = p.shelfId && owned.find((g) => g.id === p.shelfId);
   return (
     <div className="detail" style={{ padding: "12px 0 0" }}>
       <label className="f">Game<input value={p.name} onChange={set("name")} /></label>
-      <div className="two">
-        <label className="f">Platform
-          <select value={p.platform} onChange={set("platform")}>{PLATFORMS.map((x) => <option key={x}>{x}</option>)}</select>
-        </label>
-        <label className="f">Pledge ID<input value={p.pledgeId || ""} onChange={set("pledgeId")} autoCapitalize="characters" autoCorrect="off" /></label>
-      </div>
       <label className="f">Status
-        <select value={p.status} onChange={(e) => upd(p.id, (x) => ({ ...x, status: e.target.value, ...(e.target.value === "Completed" ? { deliveredOn: x.deliveredOn || today() } : { deliveredOn: undefined, prevStatus: undefined }) }))}>
-          {PLEDGE_STATUSES.map((x) => <option key={x} value={x}>{x} ({PLEDGE_HINT[x].toLowerCase()})</option>)}
+        <select value={p.status} onChange={setStatus}>
+          {PLEDGE_STATUSES.map((x) => <option key={x} value={x}>{x} ({PLEDGE_HINT[x]})</option>)}
         </select>
       </label>
       <div className="two">
-        <label className="f">Amount
-          <input inputMode="decimal" defaultValue={p.amount} onBlur={(e) => { const v = parseFloat(e.target.value.replace(/,/g, "")); upd(p.id, (x) => ({ ...x, amount: isNaN(v) ? 0 : v })); }} />
+        <label className="f">Backed on
+          <select value={p.platform} onChange={set("platform")}>{PLATFORMS.map((x) => <option key={x}>{x}</option>)}</select>
         </label>
+        <label className="f">Pledge manager
+          <select value={p.pledgeManager} onChange={set("pledgeManager")}>{[...new Set([...PLEDGE_MANAGERS, p.pledgeManager])].map((x) => <option key={x} value={x}>{x === "none yet" ? "None yet" : x}</option>)}</select>
+        </label>
+      </div>
+      <label className="f">Pledge ID or confirmation<input value={p.pledgeId || ""} onChange={set("pledgeId")} autoCapitalize="characters" autoCorrect="off" /></label>
+      <label className="f">Tier<input value={p.tier || ""} onChange={set("tier")} /></label>
+      <label className="f">Add-ons<input value={p.addOns || ""} onChange={set("addOns")} /></label>
+      <div className="two">
+        <label className="f">Pledge amount<input inputMode="decimal" defaultValue={p.pledgeAmount ?? ""} onBlur={setNum("pledgeAmount")} /></label>
         <label className="f">Currency
           <select value={p.currency} onChange={set("currency")}>{[...new Set([...CURRENCIES, p.currency])].map((x) => <option key={x}>{x}</option>)}</select>
         </label>
       </div>
       <div className="two">
-        <label className="f">Order date<input type="date" value={p.orderDate || ""} onChange={set("orderDate")} /></label>
-        <label className="f">Estimated delivery<input value={p.estDelivery || ""} onChange={set("estDelivery")} placeholder="e.g. Q3 2027" /></label>
+        <label className="f">Extra charges<input inputMode="decimal" defaultValue={p.extraCharges ?? ""} onBlur={setNum("extraCharges")} placeholder="Shipping, tax…" /></label>
+        <label className="f">Total paid<input inputMode="decimal" defaultValue={p.totalPaid ?? ""} onBlur={setNum("totalPaid")} placeholder="If known" /></label>
+      </div>
+      <div className="two">
+        <label className="f">Backed<input type="date" value={p.backedDate || ""} onChange={set("backedDate")} /></label>
+        <label className="f">Charged<input type="date" value={p.chargeDate || ""} onChange={set("chargeDate")} /></label>
+      </div>
+      <div className="two">
+        <label className="f">Estimated delivery<input type="month" value={p.estDelivery || ""} onChange={set("estDelivery")} /></label>
+        <label className="f">Received<input type="date" value={p.receivedDate || ""} onChange={set("receivedDate")} /></label>
       </div>
       <label className="f">Notes<textarea style={{ minHeight: 70 }} value={p.notes || ""} onChange={set("notes")} /></label>
+      <div style={{ display: "grid", gap: 2 }}>
+        <Toggle label={linked ? `On shelf (as ${linked.name})` : "On shelf"} checked={p.onShelf} onChange={(on) => upd(p.id, (x) => ({ ...x, onShelf: on, shelfId: on ? x.shelfId : undefined, notShelfItem: on ? false : x.notShelfItem }))} />
+        <Toggle label="Not a shelf item (digital, promo, accessory)" checked={p.notShelfItem} onChange={(on) => upd(p.id, (x) => ({ ...x, notShelfItem: on, onShelf: on ? false : x.onShelf }))} />
+      </div>
+      {!p.onShelf && !p.notShelfItem && (
+        <label className="f">Already on your shelf as…
+          <select value="" onChange={(e) => e.target.value && upd(p.id, (x) => ({ ...x, onShelf: true, shelfId: e.target.value }))}>
+            <option value="">Pick a shelf game to link</option>
+            {owned.map((g) => <option key={g.id} value={g.id}>{g.name}</option>)}
+          </select>
+        </label>
+      )}
       <div className="bar" style={{ margin: 0, flexWrap: "wrap" }}>
-        {!p.shelfId && p.status !== "Pledged" && <button className="btn felt" onClick={onShelve}>{p.status === "Completed" ? "Add to shelf" : "Received → add to shelf"}</button>}
+        {!p.onShelf && !p.notShelfItem && p.status !== "Ukraine" && <button className="btn felt" onClick={onShelve}>{p.status === "Received" ? "Add to shelf" : "Received → add to shelf"}</button>}
         <button className="x" onClick={onDelete}>Delete pledge</button>
       </div>
     </div>
   );
 }
 
-function Pledges({ store, setStore, onAddToShelf, setToast, syncErr }) {
+function Pledges({ store, setStore, onAddToShelf, setToast, syncErr, owned }) {
   const [openId, setOpenId] = useState(null);
   const [adding, setAdding] = useState(null); // null | "one" | "paste"
   const [draft, setDraft] = useState(null);
   const [pasteText, setPasteText] = useState("");
-  const [pastePlatform, setPastePlatform] = useState("Gamefound");
   const [pasteErr, setPasteErr] = useState("");
-  const [longFirst, setLongFirst] = useState(false);
   const [shelving, setShelving] = useState(null); // { id, name }
   const list = store.pledges || [];
+  const ownedSorted = useMemo(() => [...owned].sort((a, b) => a.name.localeCompare(b.name)), [owned]);
 
   const upd = (id, fn) => setStore((s) => ({ ...s, pledges: s.pledges.map((p) => (p.id === id ? { ...fn(p), updatedAt: Date.now() } : p)) }));
   const removeP = (p) => {
@@ -415,25 +481,20 @@ function Pledges({ store, setStore, onAddToShelf, setToast, syncErr }) {
     setOpenId(null);
     setToast(`Deleted pledge for ${p.name}`);
   };
-  const setDelivered = (p, on) => {
-    upd(p.id, (x) => on
-      ? { ...x, status: "Completed", prevStatus: x.status === "Completed" ? x.prevStatus : x.status, deliveredOn: x.deliveredOn || today() }
-      : { ...x, status: x.prevStatus && x.prevStatus !== "Completed" ? x.prevStatus : "Shipped", prevStatus: undefined, deliveredOn: undefined });
-    setToast(on ? `${p.name} marked delivered` : `${p.name} back to ${p.prevStatus && p.prevStatus !== "Completed" ? p.prevStatus : "Shipped"}`);
-  };
   const startShelve = (p) => setShelving({ id: p.id, name: shelfName(p.name) });
+  const blank = () => ({ name: "", platform: "Kickstarter", pledgeManager: "none yet", pledgeId: "", status: "Backed", pledgeAmount: "", currency: "USD", backedDate: today(), chargeDate: "", estDelivery: "", tier: "", addOns: "", notes: "" });
   const saveDraft = () => {
     if (!draft.name.trim()) return;
-    const amount = parseFloat(String(draft.amount).replace(/,/g, ""));
-    const p = { ...draft, id: uid(), name: draft.name.trim(), amount: isNaN(amount) ? 0 : amount, updatedAt: Date.now() };
+    const p = { ...draft, id: uid(), name: draft.name.trim(), pledgeAmount: num(String(draft.pledgeAmount).replace(/,/g, "")) || 0, onShelf: false, updatedAt: Date.now() };
+    Object.keys(p).forEach((k) => p[k] === "" && delete p[k]);
     setStore((s) => ({ ...s, pledges: [...(s.pledges || []), p] }));
     setAdding(null); setDraft(null);
     setToast(`Added pledge for ${p.name}`);
   };
   const importPaste = () => {
-    const { ok, bad } = parsePledgeLines(pasteText, pastePlatform);
-    const have = new Set(list.map((p) => `${p.platform}|${norm(p.pledgeId)}`));
-    const fresh = ok.filter((p) => !p.pledgeId || !have.has(`${p.platform}|${norm(p.pledgeId)}`));
+    const { ok, bad } = parsePledgeLines(pasteText);
+    const have = new Set(list.map((p) => norm(p.name)));
+    const fresh = ok.filter((p) => !have.has(norm(p.name)));
     if (fresh.length) setStore((s) => ({ ...s, pledges: [...(s.pledges || []), ...fresh] }));
     const skipped = ok.length - fresh.length;
     setPasteErr(bad.length ? `Couldn't read ${bad.length} line${bad.length === 1 ? "" : "s"}: ${bad.slice(0, 3).join("; ")}` : "");
@@ -441,41 +502,57 @@ function Pledges({ store, setStore, onAddToShelf, setToast, syncErr }) {
     if (!bad.length) { setPasteText(""); setAdding(null); }
   };
 
-  const open = list.filter((p) => p.status !== "Completed");
+  const open = list.filter((p) => !isClosed(p));
   const totals = {};
-  open.forEach((p) => { totals[p.currency] = (totals[p.currency] || 0) + (Number(p.amount) || 0); });
-  const byDate = (a, b) => (a.orderDate || "9").localeCompare(b.orderDate || "9");
-  const needs = open.filter((p) => p.status === "Pledged").sort(byDate);
-  const waiting = open.filter((p) => p.status !== "Pledged")
-    .sort((a, b) => longFirst ? byDate(a, b) : PLEDGE_RANK[a.status] - PLEDGE_RANK[b.status] || byDate(a, b));
-  const done = list.filter((p) => p.status === "Completed")
-    .sort((a, b) => (b.deliveredOn || b.orderDate || "").localeCompare(a.deliveredOn || a.orderDate || ""));
+  open.forEach((p) => { totals[p.currency] = (totals[p.currency] || 0) + pledgeCost(p); });
+  const byWait = (a, b) => (waitFrom(a) || "9").localeCompare(waitFrom(b) || "9");
+  const of = (...sts) => open.filter((p) => sts.includes(p.status)).sort(byWait);
+  const needs = of("PM open");
+  const upcoming = of("Backed").sort((a, b) => (a.chargeDate || "9").localeCompare(b.chargeDate || "9"));
+  const groups = [
+    ["Shipping", of("Shipping")],
+    ["Order locked / PM done", of("Order locked", "PM done")],
+    ["Charged", of("Charged")],
+    ["In production", of("In production")],
+  ];
+  const received = list.filter((p) => p.status === "Received")
+    .sort((a, b) => (b.receivedDate || "").localeCompare(a.receivedDate || "") || a.name.localeCompare(b.name));
+  const ukraine = list.filter((p) => p.status === "Ukraine");
   const longCount = open.filter(isLongWait).length;
-  const toShelve = done.filter((p) => !p.shelfId).length;
+  const toShelve = received.filter((p) => !p.onShelf && !p.notShelfItem).length;
+
+  const dateLine = (p) => {
+    if (p.status === "Received") return p.receivedDate ? `Received ${fmtDate(p.receivedDate)}` : "";
+    if (p.status === "Backed" && p.chargeDate) {
+      const d = Math.round((new Date(p.chargeDate + "T12:00:00") - new Date(today() + "T12:00:00")) / 86400000);
+      return `Charges ${fmtDate(p.chargeDate)}${d >= 0 && d <= 30 ? ` (${d === 0 ? "today" : d === 1 ? "tomorrow" : `in ${d} days`})` : ""}`;
+    }
+    if (p.chargeDate) return `Charged ${fmtDate(p.chargeDate)}`;
+    if (p.backedDate) return `Backed ${fmtDate(p.backedDate)}`;
+    return "";
+  };
 
   const card = (p) => {
     const isOpen = openId === p.id;
-    const delivered = p.status === "Completed";
     const long = isLongWait(p);
-    const showShelveBtn = !p.shelfId && (p.status === "Shipped" || delivered);
+    const showShelve = !p.onShelf && !p.notShelfItem && !isOpen && (p.status === "Shipping" || p.status === "Received");
+    const sub = [p.platform + (p.pledgeManager && p.pledgeManager !== "none yet" && p.pledgeManager !== p.platform ? ` via ${p.pledgeManager}` : ""), p.pledgeId ? `#${p.pledgeId}` : ""].filter(Boolean).join(" · ");
+    const when = [dateLine(p), !isClosed(p) && p.estDelivery ? `Est. ${fmtMonth(p.estDelivery)}` : ""].filter(Boolean).join(" · ");
     return (
-      <div className={`pledge${long ? " long" : ""}${p.status === "Pledged" ? " act" : ""}`} key={p.id} id={`p-${p.id}`}>
+      <div className={`pledge${long ? " long" : ""}${p.status === "PM open" ? " act" : ""}`} key={p.id} id={`p-${p.id}`}>
         <div className="prow">
           <button className="name" aria-expanded={isOpen} onClick={() => setOpenId(isOpen ? null : p.id)}>
             <b>{p.name}</b>
-            <span>{p.platform}{p.pledgeId ? ` · #${p.pledgeId}` : ""}</span>
-            <span>{p.orderDate ? `Ordered ${fmtDate(p.orderDate)}` : "No order date"}{p.estDelivery ? ` · Est. ${p.estDelivery}` : ""}{delivered && p.deliveredOn ? ` · Delivered ${fmtDate(p.deliveredOn)}` : ""}</span>
+            {p.tier ? <span>{p.tier}</span> : null}
+            <span>{sub}</span>
+            {when ? <span>{when}</span> : null}
           </button>
-          <div className="amt">{fmtMoney(p.amount, p.currency)}</div>
+          <div className="amt">{fmtMoney(pledgeCost(p), p.currency)}</div>
         </div>
         <div className="pmeta">
-          <span className={`pill s${PLEDGE_RANK[p.status] ?? 2}`}>{p.status}</span>
+          <span className={`pill st-${norm(p.status)}`}>{p.status}</span>
           {long && <span className="pill late">Waiting {waitYears(p)} years</span>}
-          {p.shelfId && <span className="pill">On shelf</span>}
-          <label className="switch">
-            <span>Delivered</span>
-            <input type="checkbox" role="switch" checked={delivered} onChange={(e) => setDelivered(p, e.target.checked)} aria-label={`${p.name} delivered`} />
-          </label>
+          {p.status === "Received" && (p.notShelfItem ? <span className="pill">Not a shelf item</span> : p.onShelf ? <span className="pill">On shelf</span> : <span className="pill warn">Not on shelf yet</span>)}
         </div>
         {p.notes && !isOpen ? <p className="hint" style={{ margin: 0 }}>{p.notes}</p> : null}
         {shelving?.id === p.id ? (
@@ -483,19 +560,29 @@ function Pledges({ store, setStore, onAddToShelf, setToast, syncErr }) {
             <label className="f">Name on your shelf
               <input autoFocus value={shelving.name} onChange={(e) => setShelving({ ...shelving, name: e.target.value })} />
             </label>
-            <p className="hint" style={{ margin: 0 }}>Added as Sealed, owned since today. The title is checked against BoardGameGeek like any other add. The pledge is marked Completed.</p>
+            <p className="hint" style={{ margin: 0 }}>Added as Sealed, owned since today, and checked against BoardGameGeek like any other add. The pledge is marked Received.</p>
             <div className="bar" style={{ margin: 0 }}>
               <button className="btn felt" disabled={!shelving.name.trim()} onClick={() => { onAddToShelf(p, shelving.name); setShelving(null); setOpenId(null); }}>Add to shelf</button>
               <button className="btn ghost" onClick={() => setShelving(null)}>Cancel</button>
             </div>
           </div>
-        ) : showShelveBtn && !isOpen ? (
-          <button className="btn felt" style={{ justifySelf: "start" }} onClick={() => startShelve(p)}>{delivered ? "Add to shelf" : "Received → add to shelf"}</button>
+        ) : showShelve ? (
+          <div className="bar" style={{ margin: 0, flexWrap: "wrap" }}>
+            <button className="btn felt" onClick={() => startShelve(p)}>{p.status === "Received" ? "Add to shelf" : "Received → add to shelf"}</button>
+            {p.status === "Received" && <button className="x" style={{ color: "var(--muted)" }} onClick={() => upd(p.id, (x) => ({ ...x, notShelfItem: true, onShelf: false }))}>Not a shelf item</button>}
+          </div>
         ) : null}
-        {isOpen && <PledgeEdit key={p.id} p={p} upd={upd} onDelete={() => removeP(p)} onShelve={() => startShelve(p)} />}
+        {isOpen && <PledgeEdit key={p.id} p={p} upd={upd} owned={ownedSorted} onDelete={() => removeP(p)} onShelve={() => startShelve(p)} />}
       </div>
     );
   };
+  const section = (title, items, hint) => items.length > 0 && (
+    <React.Fragment key={title}>
+      <h2>{title} ({items.length})</h2>
+      {hint && <p className="hint">{hint}</p>}
+      <div className="list">{items.map(card)}</div>
+    </React.Fragment>
+  );
 
   return (
     <>
@@ -503,7 +590,7 @@ function Pledges({ store, setStore, onAddToShelf, setToast, syncErr }) {
 
       {open.length > 0 && (
         <div className="totals">
-          <small>Still outstanding ({open.length} pledge{open.length === 1 ? "" : "s"})</small>
+          <small>Still outstanding ({open.length} pledge{open.length === 1 ? "" : "s"}, not counting Received or Ukraine)</small>
           <div className="cur">
             {Object.keys(totals).sort().map((c) => <div key={c}><strong>{fmtMoney(totals[c], c)}</strong><small>{c}</small></div>)}
           </div>
@@ -514,19 +601,21 @@ function Pledges({ store, setStore, onAddToShelf, setToast, syncErr }) {
         <div className="sheet">
           <label className="f">Game<input autoFocus value={draft.name} onChange={(e) => setDraft({ ...draft, name: e.target.value })} /></label>
           <div className="two">
-            <label className="f">Platform<select value={draft.platform} onChange={(e) => setDraft({ ...draft, platform: e.target.value })}>{PLATFORMS.map((x) => <option key={x}>{x}</option>)}</select></label>
-            <label className="f">Pledge ID<input value={draft.pledgeId} onChange={(e) => setDraft({ ...draft, pledgeId: e.target.value })} autoCapitalize="characters" autoCorrect="off" /></label>
+            <label className="f">Backed on<select value={draft.platform} onChange={(e) => setDraft({ ...draft, platform: e.target.value })}>{PLATFORMS.map((x) => <option key={x}>{x}</option>)}</select></label>
+            <label className="f">Pledge manager<select value={draft.pledgeManager} onChange={(e) => setDraft({ ...draft, pledgeManager: e.target.value })}>{PLEDGE_MANAGERS.map((x) => <option key={x} value={x}>{x === "none yet" ? "None yet" : x}</option>)}</select></label>
           </div>
-          <label className="f">Status<select value={draft.status} onChange={(e) => setDraft({ ...draft, status: e.target.value })}>{PLEDGE_STATUSES.map((x) => <option key={x}>{x}</option>)}</select></label>
+          <label className="f">Status<select value={draft.status} onChange={(e) => setDraft({ ...draft, status: e.target.value })}>{PLEDGE_STATUSES.filter((x) => x !== "Received").map((x) => <option key={x}>{x}</option>)}</select></label>
+          <label className="f">Tier<input value={draft.tier} onChange={(e) => setDraft({ ...draft, tier: e.target.value })} /></label>
           <div className="two">
-            <label className="f">Amount<input inputMode="decimal" value={draft.amount} onChange={(e) => setDraft({ ...draft, amount: e.target.value })} /></label>
+            <label className="f">Pledge amount<input inputMode="decimal" value={draft.pledgeAmount} onChange={(e) => setDraft({ ...draft, pledgeAmount: e.target.value })} /></label>
             <label className="f">Currency<select value={draft.currency} onChange={(e) => setDraft({ ...draft, currency: e.target.value })}>{CURRENCIES.map((x) => <option key={x}>{x}</option>)}</select></label>
           </div>
           <div className="two">
-            <label className="f">Order date<input type="date" value={draft.orderDate} onChange={(e) => setDraft({ ...draft, orderDate: e.target.value })} /></label>
-            <label className="f">Estimated delivery<input value={draft.estDelivery} onChange={(e) => setDraft({ ...draft, estDelivery: e.target.value })} placeholder="e.g. Q3 2027" /></label>
+            <label className="f">Backed<input type="date" value={draft.backedDate} onChange={(e) => setDraft({ ...draft, backedDate: e.target.value })} /></label>
+            <label className="f">Charge date<input type="date" value={draft.chargeDate} onChange={(e) => setDraft({ ...draft, chargeDate: e.target.value })} /></label>
           </div>
-          <label className="f">Notes<textarea style={{ minHeight: 70 }} value={draft.notes} onChange={(e) => setDraft({ ...draft, notes: e.target.value })} /></label>
+          <label className="f">Estimated delivery<input type="month" value={draft.estDelivery} onChange={(e) => setDraft({ ...draft, estDelivery: e.target.value })} /></label>
+          <p className="hint" style={{ margin: 0 }}>Everything else (ID, add-ons, extra charges, notes) can be filled in by tapping the pledge after adding it.</p>
           <div className="bar" style={{ margin: 0 }}>
             <button className="btn" disabled={!draft.name.trim()} onClick={saveDraft}>Add pledge</button>
             <button className="btn ghost" onClick={() => { setAdding(null); setDraft(null); }}>Cancel</button>
@@ -534,10 +623,10 @@ function Pledges({ store, setStore, onAddToShelf, setToast, syncErr }) {
         </div>
       ) : adding === "paste" ? (
         <div className="sheet">
-          <label className="f">Platform<select value={pastePlatform} onChange={(e) => setPastePlatform(e.target.value)}>{PLATFORMS.map((x) => <option key={x}>{x}</option>)}</select></label>
           <label className="f">One pledge per line
-            <textarea value={pasteText} onChange={(e) => setPasteText(e.target.value)} placeholder={"Game | Pledge ID | 2026-10-16 | EUR 104.00 | Pledged"} autoCapitalize="off" autoCorrect="off" />
+            <textarea value={pasteText} onChange={(e) => setPasteText(e.target.value)} placeholder={"Game | Kickstarter | BackerKit | PM open | USD 560 | notes"} autoCapitalize="off" autoCorrect="off" />
           </label>
+          <p className="hint" style={{ margin: 0 }}>Name | Kickstarter or Gamefound | pledge manager | status | currency and amount | notes. Games already here are skipped.</p>
           {pasteErr && <p className="hint" style={{ color: "var(--tag)", margin: 0 }}>{pasteErr}</p>}
           <div className="bar" style={{ margin: 0 }}>
             <button className="btn" disabled={!pasteText.trim()} onClick={importPaste}>Add pledges</button>
@@ -546,39 +635,44 @@ function Pledges({ store, setStore, onAddToShelf, setToast, syncErr }) {
         </div>
       ) : (
         <div className="bar">
-          <button className="btn" onClick={() => { setAdding("one"); setDraft({ name: "", platform: "Gamefound", pledgeId: "", status: "Pledged", amount: "", currency: "USD", orderDate: today(), estDelivery: "", notes: "" }); }}>Add a pledge</button>
+          <button className="btn" onClick={() => { setAdding("one"); setDraft(blank()); }}>Add a pledge</button>
           <button className="btn ghost" onClick={() => setAdding("paste")}>Paste a list</button>
         </div>
       )}
 
       {list.length === 0 && !adding && (
-        <div className="empty">No pledges yet. Add your Gamefound and Kickstarter pledges here. They stay separate from your shelf until they arrive.</div>
+        <div className="empty">No pledges yet. Add your Kickstarter and Gamefound pledges here. They stay separate from your shelf until they arrive.</div>
       )}
 
       {needs.length > 0 && (
         <section className="needs">
           <h2>Needs action ({needs.length})</h2>
-          <p className="hint">Pledge manager not done yet. Finish these when their pledge manager opens.</p>
+          <p className="hint">Pledge manager is open: fill in the survey, add-ons, address or payment.</p>
           <div className="list">{needs.map(card)}</div>
         </section>
       )}
 
-      {waiting.length > 0 && (
-        <>
-          <h2>On the way ({waiting.length})</h2>
-          {longCount > 0 && <p className="hint">{longCount} ordered {LONG_WAIT_YEARS}+ years ago, marked in red.</p>}
-          <div className="chips">
-            <button className="chip" aria-pressed={!longFirst} onClick={() => setLongFirst(false)}>By status</button>
-            <button className="chip" aria-pressed={longFirst} onClick={() => setLongFirst(true)}>Longest wait first</button>
-          </div>
-          <div className="list">{waiting.map(card)}</div>
-        </>
+      {upcoming.length > 0 && (
+        <section className="upcoming">
+          <h2>Upcoming charges ({upcoming.length})</h2>
+          <p className="hint">Campaigns still live. Your card is charged when they end.</p>
+          <div className="list">{upcoming.map(card)}</div>
+        </section>
       )}
 
-      {done.length > 0 && (
+      {longCount > 0 && <p className="hint" style={{ marginTop: 14 }}>{longCount} pledge{longCount === 1 ? " is" : "s are"} {LONG_WAIT_YEARS}+ years past the backed date, marked in red.</p>}
+      {groups.map(([title, items]) => section(title, items))}
+
+      {received.length > 0 && (
         <details className="more" style={{ marginTop: 18 }}>
-          <summary>Completed ({done.length}){toShelve ? <small> · {toShelve} not on the shelf yet</small> : null}</summary>
-          <div className="list">{done.map(card)}</div>
+          <summary>Received ({received.length}){toShelve ? <small> · {toShelve} not on the shelf yet</small> : null}</summary>
+          <div className="list">{received.map(card)}</div>
+        </details>
+      )}
+      {ukraine.length > 0 && (
+        <details className="more" style={{ marginTop: 10 }}>
+          <summary>Ukraine ({ukraine.length}) <small>· stalled, left out of totals</small></summary>
+          <div className="list">{ukraine.map(card)}</div>
         </details>
       )}
     </>
@@ -792,7 +886,11 @@ details.more details.more{background:var(--card)}
 .view .dot{display:inline-block;width:9px;height:9px;border-radius:50%;background:var(--meeple);margin-left:6px;vertical-align:middle}
 .cur{display:grid;grid-template-columns:repeat(auto-fit,minmax(120px,1fr));gap:10px}
 .cur strong{font-family:'Bricolage Grotesque',sans-serif;font-size:24px;display:block;font-variant-numeric:tabular-nums}
-.pledge{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:10px 12px;display:grid;gap:6px}
+.pledge{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:10px 12px;display:grid;grid-template-columns:minmax(0,1fr);gap:6px}
+.pledge>*,.pledge .detail>*{min-width:0}
+.pledge .detail{grid-template-columns:minmax(0,1fr)}
+.pledge .two{grid-template-columns:minmax(0,1fr) minmax(0,1fr)}
+.pledge select,.pledge input{max-width:100%;min-width:0}
 .pledge.act{border:2px solid var(--meeple)}
 .pledge.long{border-left:6px solid var(--tag)}
 .prow{display:flex;gap:10px;align-items:flex-start}
@@ -801,9 +899,14 @@ details.more details.more{background:var(--card)}
 .amt{font-weight:700;font-size:16px;white-space:nowrap;font-variant-numeric:tabular-nums;padding-top:2px}
 .pmeta{display:flex;flex-wrap:wrap;gap:6px;align-items:center}
 .pill{border-radius:999px;padding:2px 10px;font-size:13px;font-weight:600;background:var(--paper);border:1px solid var(--line);white-space:nowrap}
-.pill.s0{background:var(--felt);border-color:var(--felt);color:#fff}
-.pill.s1{background:#D5E6DF;border-color:#A9C9BC}
-.pill.s3{background:var(--meeple);border-color:var(--meeple)}
+.pill.st-shipping{background:var(--felt);border-color:var(--felt);color:#fff}
+.pill.st-orderlocked,.pill.st-pmdone{background:#D5E6DF;border-color:#A9C9BC}
+.pill.st-pmopen{background:var(--meeple);border-color:var(--meeple)}
+.pill.st-backed{background:#DCE3F2;border-color:#AFBDD9}
+.pill.st-ukraine{background:#E3E1DC;border-color:#C9C5BC;color:var(--muted)}
+.pill.warn{border-color:var(--meeple);color:#8A5A00}
+.upcoming{background:#EEF2FA;border:2px solid #AFBDD9;border-radius:12px;padding:2px 10px 10px;margin-bottom:6px}
+.upcoming h2{margin-top:10px}
 .pill.late{background:var(--tag);border-color:var(--tag);color:#fff}
 .switch{margin-left:auto;display:flex;align-items:center;gap:8px;font-size:14px;font-weight:600;min-height:44px;cursor:pointer;color:var(--ink)}
 .switch input{-webkit-appearance:none;appearance:none;width:48px;height:28px;flex:none;border-radius:999px;background:var(--line);position:relative;margin:0;padding:0;border:0;cursor:pointer;transition:background .15s}
@@ -2269,15 +2372,15 @@ function App() {
     checkTitles(fresh);
   };
 
-  // The one bridge between pledges and the shelf: a delivered pledge becomes a normal shelf game
+  // The one bridge between pledges and the shelf: a received pledge becomes a normal shelf game
   const addPledgeToShelf = (p, name) => {
     const nm = name.trim();
     if (!nm) return;
     const existing = owned.find((g) => norm(g.name) === norm(nm));
     let shelfId;
-    if (existing && !window.confirm(`${existing.name} is already on your shelf.\n\nOK: add a second copy.\nCancel: don't add anything, just mark the pledge delivered and link it to the copy you have.`)) {
+    if (existing && !window.confirm(`${existing.name} is already on your shelf.\n\nOK: add a second copy.\nCancel: don't add anything, just mark the pledge received and link it to the copy you have.`)) {
       shelfId = existing.id;
-      setToast(`${p.name} marked delivered`);
+      setToast(`${p.name} marked received and linked to your shelf`);
     } else {
       const g = { id: uid(), name: nm, condition: "Sealed", ownedSince: today(), plays: [], keep: false, status: "owned", updatedAt: Date.now(), addedAt: today() };
       setData((d) => ({ ...d, games: [...d.games, g] }));
@@ -2288,8 +2391,8 @@ function App() {
     setPledgeData((s) => ({
       ...s,
       pledges: s.pledges.map((x) => x.id === p.id ? {
-        ...x, status: "Completed", prevStatus: x.status === "Completed" ? x.prevStatus : x.status,
-        deliveredOn: x.deliveredOn || today(), shelfId, updatedAt: Date.now(),
+        ...x, status: "Received", receivedDate: x.receivedDate || today(),
+        onShelf: true, notShelfItem: false, shelfId, updatedAt: Date.now(),
       } : x),
     }));
   };
@@ -2391,8 +2494,8 @@ function App() {
 
   if (!loaded) return <div className="bg"><div className="app"><style>{css}</style><p className="sub">Loading your shelf… (version {APP_VERSION})</p></div></div>;
 
-  const openPledges = pledgeData.pledges.filter((p) => p.status !== "Completed");
-  const pledgeActions = openPledges.filter((p) => p.status === "Pledged").length;
+  const openPledges = pledgeData.pledges.filter((p) => !isClosed(p));
+  const pledgeActions = openPledges.filter((p) => p.status === "PM open").length;
   return (
     <div className={`bg${view === "pledges" ? " pl" : ""}`}>
       <div className={`app${view === "pledges" ? " pl" : ""}`}>
@@ -2406,7 +2509,7 @@ function App() {
         </div>
         <p className="sub">
           {view === "pledges" ? (
-            <>{openPledges.length} pledge{openPledges.length === 1 ? "" : "s"} still on the way.{pledgeActions ? ` ${pledgeActions} need${pledgeActions === 1 ? "s" : ""} the pledge manager.` : ""} Pledges stay off your shelf until they arrive.</>
+            <>{openPledges.length} pledge{openPledges.length === 1 ? "" : "s"} still on the way.{pledgeActions ? ` ${pledgeActions} need${pledgeActions === 1 ? "s" : ""} action in the pledge manager.` : ""} Pledges stay off your shelf until they arrive.</>
           ) : (<>
           {shelfGames.length} game{shelfGames.length === 1 ? "" : "s"} owned{boxed.length ? ` (plus ${boxed.length} stored in other boxes)` : ""}. {dusty.length} haven't been played in {data.dustMonths} months.{wishes.length ? ` ${wishes.length} on the wish list.` : ""}
           </>)}
@@ -2415,7 +2518,7 @@ function App() {
 
         {msg && <div className="msg" role="status">{msg} <button className="x" onClick={() => setMsg("")}>Dismiss</button></div>}
 
-        {view === "pledges" && <Pledges store={pledgeData} setStore={setPledgeData} onAddToShelf={addPledgeToShelf} setToast={setToast} syncErr={syncCfg ? pledgeSyncErr : ""} />}
+        {view === "pledges" && <Pledges store={pledgeData} setStore={setPledgeData} onAddToShelf={addPledgeToShelf} owned={owned} setToast={setToast} syncErr={syncCfg ? pledgeSyncErr : ""} />}
 
         {view === "shelf" && (<>
         <div className="tabs" role="tablist">
