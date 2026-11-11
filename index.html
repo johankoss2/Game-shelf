@@ -62,7 +62,7 @@ window.addEventListener("error", function (e) {
 <script type="text/babel" data-presets="react">
 const { useState, useEffect, useMemo, useRef } = React;
 
-const APP_VERSION = "2.5";
+const APP_VERSION = "2.6";
 const KEY = "boardgame-shelf-v1";
 const ART_KEY = "boardgame-art-v1";
 const SYNC_KEY = "boardgame-sync-v1";
@@ -316,7 +316,7 @@ const PLEDGE_HINT = {
   "In production": "being made",
   "Shipping": "on its way",
   "Received": "arrived",
-  "Ukraine": "stalled, not expected; left out of totals",
+  "Ukraine": "stalled, not expected; no overdue flag",
 };
 const CURRENCIES = ["USD", "EUR", "GBP", "CAD"];
 const LONG_WAIT_YEARS = 2;
@@ -335,6 +335,14 @@ const fmtMoney = (amt, cur) => {
   catch (e) { return `${cur || ""} ${n.toFixed(2)}`.trim(); }
 };
 const fmtMonth = (m) => (m && /^\d{4}-\d{2}$/.test(m) ? new Date(m + "-15T12:00:00").toLocaleDateString(undefined, { month: "short", year: "numeric" }) : m || "");
+// Pledge page link: add https:// if it was left off, and name the site for the button
+const fixUrl = (u) => { const t = (u || "").trim(); return !t ? "" : /^https?:\/\//i.test(t) ? t : `https://${t}`; };
+const linkSite = (u) => {
+  const h = (() => { try { return new URL(u).hostname.replace(/^www\./, ""); } catch (e) { return ""; } })();
+  const known = { "kickstarter.com": "Kickstarter", "gamefound.com": "Gamefound", "backerkit.com": "BackerKit", "pledgemanager.com": "PledgeManager", "hivepledge.com": "Hive", "allplay.com": "Allplay" };
+  const k = Object.keys(known).find((d) => h === d || h.endsWith("." + d));
+  return k ? known[k] : h;
+};
 // "Gang Wars (+ Scarface 1920 Reprint)" -> "Gang Wars", a better guess for the title check
 const shelfName = (n) => (n || "").replace(/\s*\([^)]*\)/g, "").replace(/\s+/g, " ").trim() || n;
 // Upgrade a record saved by version 2.4 without touching its edit time
@@ -423,6 +431,10 @@ function PledgeEdit({ p, upd, onDelete, onShelve, owned }) {
         </label>
       </div>
       <label className="f">Pledge ID or confirmation<input value={p.pledgeId || ""} onChange={set("pledgeId")} autoCapitalize="characters" autoCorrect="off" /></label>
+      <label className="f">Pledge link
+        <input type="url" inputMode="url" defaultValue={p.url || ""} placeholder="Paste the pledge page address" autoCapitalize="off" autoCorrect="off"
+          onBlur={(e) => { const u = fixUrl(e.target.value); e.target.value = u; upd(p.id, (x) => ({ ...x, url: u || undefined })); }} />
+      </label>
       <label className="f">Tier<input value={p.tier || ""} onChange={set("tier")} /></label>
       <label className="f">Add-ons<input value={p.addOns || ""} onChange={set("addOns")} /></label>
       <div className="two">
@@ -503,8 +515,6 @@ function Pledges({ store, setStore, onAddToShelf, setToast, syncErr, owned }) {
   };
 
   const open = list.filter((p) => !isClosed(p));
-  const totals = {};
-  open.forEach((p) => { totals[p.currency] = (totals[p.currency] || 0) + pledgeCost(p); });
   const byWait = (a, b) => (waitFrom(a) || "9").localeCompare(waitFrom(b) || "9");
   const of = (...sts) => open.filter((p) => sts.includes(p.status)).sort(byWait);
   const needs = of("PM open");
@@ -553,6 +563,7 @@ function Pledges({ store, setStore, onAddToShelf, setToast, syncErr, owned }) {
           <span className={`pill st-${norm(p.status)}`}>{p.status}</span>
           {long && <span className="pill late">Waiting {waitYears(p)} years</span>}
           {p.status === "Received" && (p.notShelfItem ? <span className="pill">Not a shelf item</span> : p.onShelf ? <span className="pill">On shelf</span> : <span className="pill warn">Not on shelf yet</span>)}
+          {p.url && <a className="plink" href={p.url} target="_blank" rel="noreferrer">Open on {linkSite(p.url)} ↗</a>}
         </div>
         {p.notes && !isOpen ? <p className="hint" style={{ margin: 0 }}>{p.notes}</p> : null}
         {shelving?.id === p.id ? (
@@ -587,15 +598,6 @@ function Pledges({ store, setStore, onAddToShelf, setToast, syncErr, owned }) {
   return (
     <>
       {syncErr && <div className="msg" role="status">Pledges didn't sync: {syncErr}</div>}
-
-      {open.length > 0 && (
-        <div className="totals">
-          <small>Still outstanding ({open.length} pledge{open.length === 1 ? "" : "s"}, not counting Received or Ukraine)</small>
-          <div className="cur">
-            {Object.keys(totals).sort().map((c) => <div key={c}><strong>{fmtMoney(totals[c], c)}</strong><small>{c}</small></div>)}
-          </div>
-        </div>
-      )}
 
       {adding === "one" && draft ? (
         <div className="sheet">
@@ -671,7 +673,7 @@ function Pledges({ store, setStore, onAddToShelf, setToast, syncErr, owned }) {
       )}
       {ukraine.length > 0 && (
         <details className="more" style={{ marginTop: 10 }}>
-          <summary>Ukraine ({ukraine.length}) <small>· stalled, left out of totals</small></summary>
+          <summary>Ukraine ({ukraine.length}) <small>· stalled, kept on record</small></summary>
           <div className="list">{ukraine.map(card)}</div>
         </details>
       )}
@@ -884,8 +886,6 @@ details.more details.more{background:var(--card)}
 .view button{flex:1;min-height:44px;padding:8px;border:0;background:transparent;font:700 16px Figtree,sans-serif;color:var(--ink);position:relative}
 .view button[aria-pressed=true]{background:var(--ink);color:var(--paper)}
 .view .dot{display:inline-block;width:9px;height:9px;border-radius:50%;background:var(--meeple);margin-left:6px;vertical-align:middle}
-.cur{display:grid;grid-template-columns:repeat(auto-fit,minmax(120px,1fr));gap:10px}
-.cur strong{font-family:'Bricolage Grotesque',sans-serif;font-size:24px;display:block;font-variant-numeric:tabular-nums}
 .pledge{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:10px 12px;display:grid;grid-template-columns:minmax(0,1fr);gap:6px}
 .pledge>*,.pledge .detail>*{min-width:0}
 .pledge .detail{grid-template-columns:minmax(0,1fr)}
@@ -897,6 +897,7 @@ details.more details.more{background:var(--card)}
 .pledge .name b{white-space:normal}
 .pledge .name span{display:block}
 .amt{font-weight:700;font-size:16px;white-space:nowrap;font-variant-numeric:tabular-nums;padding-top:2px}
+.plink{display:inline-flex;align-items:center;min-height:44px;padding:0 4px;font-size:14px;text-decoration:none}
 .pmeta{display:flex;flex-wrap:wrap;gap:6px;align-items:center}
 .pill{border-radius:999px;padding:2px 10px;font-size:13px;font-weight:600;background:var(--paper);border:1px solid var(--line);white-space:nowrap}
 .pill.st-shipping{background:var(--felt);border-color:var(--felt);color:#fff}
