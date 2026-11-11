@@ -62,7 +62,7 @@ window.addEventListener("error", function (e) {
 <script type="text/babel" data-presets="react">
 const { useState, useEffect, useMemo, useRef } = React;
 
-const APP_VERSION = "2.6";
+const APP_VERSION = "2.7";
 const KEY = "boardgame-shelf-v1";
 const ART_KEY = "boardgame-art-v1";
 const SYNC_KEY = "boardgame-sync-v1";
@@ -303,6 +303,27 @@ const sinceLabel = (t) => {
 // in the collection, play log or sell list.
 const PLEDGE_KEY = "boardgame-pledges-v1";
 const PLEDGE_FILE = "pledges.json";
+// Pledge emails, added by a scheduled Gmail check; phones only add "read" marks
+const NEWS_KEY = "boardgame-pledge-news-v1";
+const NEWS_FILE = "pledge-news.json";
+const NEWS_DAYS = 90;
+const NEWS_KINDS = { action: "Action needed", shipping: "Shipping", payment: "Payment", update: "Update" };
+const tidyNews = (s) => {
+  const cutoff = new Date(Date.now() - NEWS_DAYS * 86400000).toISOString().slice(0, 10);
+  const items = {}, read = {};
+  Object.entries((s && s.items) || {}).forEach(([k, v]) => { if (v && (v.date || "") >= cutoff) items[k] = v; });
+  Object.entries((s && s.read) || {}).forEach(([k, t]) => { if (items[k]) read[k] = t; });
+  return { ...(s || {}), items, read };
+};
+const canonNews = (s) => stable(tidyNews(s));
+// Emails from either side are kept (the copy on GitHub wins if both have one), read marks are kept
+const mergeNews = (a, b) => {
+  if (!b) return tidyNews(a);
+  const read = { ...(b.read || {}) };
+  Object.entries((a && a.read) || {}).forEach(([k, t]) => { if (t > (read[k] || 0)) read[k] = t; });
+  const lastRun = [(a && a.lastRun) || "", b.lastRun || ""].sort().at(-1) || undefined;
+  return tidyNews({ ...(a || {}), ...b, items: { ...((a && a.items) || {}), ...(b.items || {}) }, read, lastRun });
+};
 const PLATFORMS = ["Kickstarter", "Gamefound"];
 const PLEDGE_MANAGERS = ["none yet", "BackerKit", "Gamefound", "Hive", "PledgeManager", "Allplay", "Kickstarter PM"];
 // Lifecycle order, plus Ukraine (stalled, kept on record only)
@@ -476,7 +497,7 @@ function PledgeEdit({ p, upd, onDelete, onShelve, owned }) {
   );
 }
 
-function Pledges({ store, setStore, onAddToShelf, setToast, syncErr, owned }) {
+function Pledges({ store, setStore, onAddToShelf, setToast, syncErr, owned, news, setNews }) {
   const [openId, setOpenId] = useState(null);
   const [adding, setAdding] = useState(null); // null | "one" | "paste"
   const [draft, setDraft] = useState(null);
@@ -531,6 +552,41 @@ function Pledges({ store, setStore, onAddToShelf, setToast, syncErr, owned }) {
   const longCount = open.filter(isLongWait).length;
   const toShelve = received.filter((p) => !p.onShelf && !p.notShelfItem).length;
 
+  // Emails about pledges (from the scheduled Gmail check)
+  const byId = Object.fromEntries(list.map((p) => [p.id, p]));
+  const isRead = (i) => !!(news.read || {})[i.id];
+  const emails = Object.values(news.items || {}).sort((a, b) => (b.date || "").localeCompare(a.date || ""));
+  const unread = emails.filter((i) => !isRead(i));
+  const unreadFor = (p) => unread.filter((i) => i.pledge === p.id).length;
+  const markRead = (ids) => setNews((s) => ({ ...s, read: { ...(s.read || {}), ...Object.fromEntries(ids.map((id) => [id, Date.now()])) } }));
+  const applySuggest = (i, p) => {
+    upd(p.id, (x) => ({ ...x, status: i.suggest, receivedDate: i.suggest === "Received" ? x.receivedDate || today() : x.receivedDate }));
+    markRead([i.id]);
+    setToast(`${p.name} set to ${i.suggest}`);
+  };
+  const emailCard = (i, compact) => {
+    const p = byId[i.pledge];
+    const canSuggest = p && i.suggest && i.suggest !== p.status && PLEDGE_STATUSES.includes(i.suggest) && !isClosed(p);
+    const fresh = !isRead(i);
+    return (
+      <div className={`newsitem k-${i.kind || "update"}${fresh ? "" : " seen"}`} key={i.id}>
+        <div className="nhead">
+          <b>{compact ? i.subject : p ? p.name : i.game || "Pledge"}</b>
+          <span>{i.date ? fmtDate(i.date.slice(0, 10)) : ""}</span>
+        </div>
+        {!compact && <p className="nsubj">{i.subject}</p>}
+        {i.summary && <p className="hint" style={{ margin: 0 }}>{i.summary}</p>}
+        <div className="nact">
+          {i.kind && i.kind !== "update" && <span className={`pill nk-${i.kind}`}>{NEWS_KINDS[i.kind] || i.kind}</span>}
+          {i.link && <a className="plink" href={i.link} target="_blank" rel="noreferrer">Open update ↗</a>}
+          {i.mail && <a className="plink" href={i.mail} target="_blank" rel="noreferrer">Email ↗</a>}
+          {canSuggest && <button className="btn felt" onClick={() => applySuggest(i, p)}>Set to {i.suggest}</button>}
+          {fresh && <button className="btn ghost" onClick={() => markRead([i.id])}>Mark read</button>}
+        </div>
+      </div>
+    );
+  };
+
   const dateLine = (p) => {
     if (p.status === "Received") return p.receivedDate ? `Received ${fmtDate(p.receivedDate)}` : "";
     if (p.status === "Backed" && p.chargeDate) {
@@ -561,6 +617,7 @@ function Pledges({ store, setStore, onAddToShelf, setToast, syncErr, owned }) {
         </div>
         <div className="pmeta">
           <span className={`pill st-${norm(p.status)}`}>{p.status}</span>
+          {unreadFor(p) > 0 && <span className="pill newp">{unreadFor(p)} new</span>}
           {long && <span className="pill late">Waiting {waitYears(p)} years</span>}
           {p.status === "Received" && (p.notShelfItem ? <span className="pill">Not a shelf item</span> : p.onShelf ? <span className="pill">On shelf</span> : <span className="pill warn">Not on shelf yet</span>)}
           {p.url && <a className="plink" href={p.url} target="_blank" rel="noreferrer">Open on {linkSite(p.url)} ↗</a>}
@@ -583,6 +640,12 @@ function Pledges({ store, setStore, onAddToShelf, setToast, syncErr, owned }) {
             {p.status === "Received" && <button className="x" style={{ color: "var(--muted)" }} onClick={() => upd(p.id, (x) => ({ ...x, notShelfItem: true, onShelf: false }))}>Not a shelf item</button>}
           </div>
         ) : null}
+        {isOpen && emails.some((i) => i.pledge === p.id) && (
+          <div style={{ display: "grid", gap: 6, paddingTop: 10 }}>
+            <label className="f" style={{ margin: 0 }}>Recent emails</label>
+            {emails.filter((i) => i.pledge === p.id).slice(0, 6).map((i) => emailCard(i, true))}
+          </div>
+        )}
         {isOpen && <PledgeEdit key={p.id} p={p} upd={upd} owned={ownedSorted} onDelete={() => removeP(p)} onShelve={() => startShelve(p)} />}
       </div>
     );
@@ -644,6 +707,17 @@ function Pledges({ store, setStore, onAddToShelf, setToast, syncErr, owned }) {
 
       {list.length === 0 && !adding && (
         <div className="empty">No pledges yet. Add your Kickstarter and Gamefound pledges here. They stay separate from your shelf until they arrive.</div>
+      )}
+
+      {unread.length > 0 && (
+        <section className="news">
+          <div className="newshead">
+            <h2>New updates ({unread.length})</h2>
+            <button className="x" onClick={() => { markRead(unread.map((i) => i.id)); setToast("All marked read"); }}>Mark all read</button>
+          </div>
+          <p className="hint">From your pledge emails, checked twice a day. Marking one read clears it on both phones.</p>
+          <div className="list">{unread.map((i) => emailCard(i, false))}</div>
+        </section>
       )}
 
       {needs.length > 0 && (
@@ -885,6 +959,24 @@ details.more details.more{background:var(--card)}
 .view{display:flex;border:2px solid var(--ink);border-radius:12px;overflow:hidden;margin:10px 0 12px}
 .view button{flex:1;min-height:44px;padding:8px;border:0;background:transparent;font:700 16px Figtree,sans-serif;color:var(--ink);position:relative}
 .view button[aria-pressed=true]{background:var(--ink);color:var(--paper)}
+.view .newcount{display:inline-block;min-width:20px;height:20px;line-height:20px;border-radius:999px;background:var(--tag);color:#fff;font:700 12px Figtree,sans-serif;font-style:normal;margin-left:6px;padding:0 5px;vertical-align:middle;box-sizing:border-box}
+.news{background:#E7F0EC;border:2px solid var(--felt);border-radius:12px;padding:2px 10px 10px;margin-bottom:6px}
+.news h2{margin:10px 0 0}
+.newshead{display:flex;align-items:center;justify-content:space-between;gap:8px}
+.newsitem{background:var(--card);border:1px solid var(--line);border-left:5px solid var(--line);border-radius:10px;padding:10px 12px;display:grid;gap:4px;min-width:0}
+.newsitem.k-action{border-left-color:var(--meeple)}
+.newsitem.k-shipping{border-left-color:var(--felt)}
+.newsitem.k-payment{border-left-color:#AFBDD9}
+.newsitem.seen{opacity:.7}
+.nhead{display:flex;justify-content:space-between;gap:10px;align-items:baseline}
+.nhead b{min-width:0;overflow-wrap:anywhere}
+.nhead span{color:var(--muted);font-size:13px;white-space:nowrap}
+.nsubj{margin:0;font-size:14.5px;overflow-wrap:anywhere}
+.nact{display:flex;flex-wrap:wrap;gap:6px;align-items:center}
+.nact .btn{padding:8px 12px;font-size:14px}
+.pill.newp{background:var(--tag);border-color:var(--tag);color:#fff}
+.pill.nk-action{background:var(--meeple);border-color:var(--meeple)}
+.pill.nk-shipping{background:var(--felt);border-color:var(--felt);color:#fff}
 .view .dot{display:inline-block;width:9px;height:9px;border-radius:50%;background:var(--meeple);margin-left:6px;vertical-align:middle}
 .pledge{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:10px 12px;display:grid;grid-template-columns:minmax(0,1fr);gap:6px}
 .pledge>*,.pledge .detail>*{min-width:0}
@@ -1903,6 +1995,7 @@ function App() {
   const [view, setView] = useState("shelf"); // "shelf" | "pledges"
   const [pledgeData, setPledgeData] = useState({ pledges: [], deleted: {} });
   const [pledgeSyncErr, setPledgeSyncErr] = useState("");
+  const [news, setNews] = useState({ items: {}, read: {} });
   const [open, setOpen] = useState(null);
   const [adding, setAdding] = useState(false);
   const [scanning, setScanning] = useState(false);
@@ -1939,6 +2032,8 @@ function App() {
   const artRef = useRef(art); artRef.current = art;
   const pledgeRef = useRef(pledgeData); pledgeRef.current = pledgeData;
   const lastPledgeSynced = useRef("");
+  const newsRef = useRef(news); newsRef.current = news;
+  const lastNewsSynced = useRef("");
   const cfgRef = useRef(null);
   const lastSynced = useRef("");
   const busyRef = useRef(false);
@@ -1962,6 +2057,10 @@ function App() {
         const pr = await window.storage.get(PLEDGE_KEY);
         if (pr && pr.value) setPledgeData(tidyPledges(JSON.parse(pr.value)));
       } catch (e) { /* no pledges yet */ }
+      try {
+        const nr = await window.storage.get(NEWS_KEY);
+        if (nr && nr.value) setNews(tidyNews(JSON.parse(nr.value)));
+      } catch (e) { /* no pledge emails yet */ }
       try {
         const s = await window.storage.get(SYNC_KEY);
         if (s && s.value) { const cfg = JSON.parse(s.value); cfgRef.current = cfg; setSyncCfg(cfg); }
@@ -1989,6 +2088,12 @@ function App() {
     window.storage.set(PLEDGE_KEY, JSON.stringify(pledgeData)).catch(() => setMsg("Couldn't save your last pledge change. Try again in a moment."));
     if (cfgRef.current && canonPledges(pledgeData) !== lastPledgeSynced.current) schedule(lastPledgeSynced.current ? 3000 : 300);
   }, [pledgeData, loaded]);
+
+  useEffect(() => {
+    if (!loaded) return;
+    window.storage.set(NEWS_KEY, JSON.stringify(news)).catch(() => {});
+    if (cfgRef.current && canonNews(news) !== lastNewsSynced.current) schedule(lastNewsSynced.current ? 3000 : 300);
+  }, [news, loaded]);
 
   // Pledges get their own background so it's always clear which side you're on
   useEffect(() => {
@@ -2082,6 +2187,7 @@ function App() {
     }
     // Pledges sync after the shelf, on their own, so a problem here can never hold up or touch shelf.json
     await syncPledges(cfg);
+    await syncNews(cfg);
     busyRef.current = false;
     if (againRef.current) { againRef.current = false; schedule(500); }
   };
@@ -2100,6 +2206,20 @@ function App() {
       setPledgeSyncErr(syncError(e));
     }
   };
+  // Same pattern for pledge emails; a problem here never affects the shelf or pledges
+  const syncNews = async (cfg, attempt = 0) => {
+    try {
+      const remote = await ghGet(cfg, NEWS_FILE);
+      const merged = mergeNews(newsRef.current, remote ? remote.json : null);
+      const mergedCanon = canonNews(merged);
+      const empty = !Object.keys(merged.items).length;
+      if (remote ? mergedCanon !== canonNews(remote.json) : !empty) await ghPut(cfg, NEWS_FILE, merged, remote && remote.sha);
+      lastNewsSynced.current = mergedCanon;
+      setNews((cur) => mergeNews(cur, merged));
+    } catch (e) {
+      if ((e.status === 409 || e.status === 422) && attempt < 2) return syncNews(cfg, attempt + 1);
+    }
+  };
   const connectSync = async (cfg) => {
     const clean = { repo: cfg.repo.trim().replace(/^https?:\/\/github\.com\//i, "").replace(/\/+$/, ""), token: cfg.token.trim() };
     setSync({ state: "syncing" });
@@ -2112,6 +2232,7 @@ function App() {
       cfgRef.current = clean;
       lastSynced.current = "";
       lastPledgeSynced.current = "";
+      lastNewsSynced.current = "";
       setSyncCfg(clean);
       setRepoDraft(""); setTokenDraft(""); setCodeDraft("");
       setToast("Connected. Syncing your shelf…");
@@ -2497,6 +2618,7 @@ function App() {
 
   const openPledges = pledgeData.pledges.filter((p) => !isClosed(p));
   const pledgeActions = openPledges.filter((p) => p.status === "PM open").length;
+  const newsUnread = Object.keys(news.items || {}).filter((id) => !(news.read || {})[id]).length;
   return (
     <div className={`bg${view === "pledges" ? " pl" : ""}`}>
       <div className={`app${view === "pledges" ? " pl" : ""}`}>
@@ -2505,7 +2627,7 @@ function App() {
         <div className="view" role="group" aria-label="Section">
           <button aria-pressed={view === "shelf"} onClick={() => setView("shelf")}>Shelf</button>
           <button aria-pressed={view === "pledges"} onClick={() => { setView("pledges"); setScanning(false); setShelfScan(false); }}>
-            Pledges{openPledges.length ? ` (${openPledges.length})` : ""}{pledgeActions ? <i className="dot" aria-label={`${pledgeActions} need action`} /> : null}
+            Pledges{openPledges.length ? ` (${openPledges.length})` : ""}{pledgeActions ? <i className="dot" aria-label={`${pledgeActions} need action`} /> : null}{newsUnread ? <i className="newcount" aria-label={`${newsUnread} new updates`}>{newsUnread}</i> : null}
           </button>
         </div>
         <p className="sub">
@@ -2519,7 +2641,7 @@ function App() {
 
         {msg && <div className="msg" role="status">{msg} <button className="x" onClick={() => setMsg("")}>Dismiss</button></div>}
 
-        {view === "pledges" && <Pledges store={pledgeData} setStore={setPledgeData} onAddToShelf={addPledgeToShelf} owned={owned} setToast={setToast} syncErr={syncCfg ? pledgeSyncErr : ""} />}
+        {view === "pledges" && <Pledges store={pledgeData} setStore={setPledgeData} onAddToShelf={addPledgeToShelf} owned={owned} setToast={setToast} syncErr={syncCfg ? pledgeSyncErr : ""} news={news} setNews={setNews} />}
 
         {view === "shelf" && (<>
         <div className="tabs" role="tablist">
