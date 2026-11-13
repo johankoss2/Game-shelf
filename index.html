@@ -62,7 +62,7 @@ window.addEventListener("error", function (e) {
 <script type="text/babel" data-presets="react">
 const { useState, useEffect, useMemo, useRef } = React;
 
-const APP_VERSION = "2.7";
+const APP_VERSION = "2.8";
 const KEY = "boardgame-shelf-v1";
 const ART_KEY = "boardgame-art-v1";
 const SYNC_KEY = "boardgame-sync-v1";
@@ -307,7 +307,7 @@ const PLEDGE_FILE = "pledges.json";
 const NEWS_KEY = "boardgame-pledge-news-v1";
 const NEWS_FILE = "pledge-news.json";
 const NEWS_DAYS = 90;
-const NEWS_KINDS = { action: "Action needed", shipping: "Shipping", payment: "Payment", update: "Update" };
+const NEWS_KINDS = { action: "Action needed", shipping: "Shipping", payment: "Payment", update: "Update", backed: "New backing", campaign: "Not following" };
 const tidyNews = (s) => {
   const cutoff = new Date(Date.now() - NEWS_DAYS * 86400000).toISOString().slice(0, 10);
   const items = {}, read = {};
@@ -397,6 +397,57 @@ const mergePledges = (a, b) => {
   });
   return tidyPledges({ ...b, ...(a || {}), pledges: Object.values(byId).filter((p) => !deleted[p.id]), deleted });
 };
+// ---------- Followed campaigns (watching, not backed) ----------
+// Their own file (follows.json), so older app versions never see or rewrite them,
+// and they never touch pledges or the shelf
+const FOLLOW_KEY = "boardgame-follows-v1";
+const FOLLOW_FILE = "follows.json";
+const tidyFollows = (s) => ({
+  ...(s || {}),
+  follows: [...((s && s.follows) || [])].sort((a, b) => (a.id < b.id ? -1 : 1)),
+  deleted: { ...((s && s.deleted) || {}) },
+  ignored: { ...((s && s.ignored) || {}) },
+});
+const canonFollows = (s) => stable(tidyFollows(s));
+const laterTimes = (x, y) => { const o = { ...(y || {}) }; Object.entries(x || {}).forEach(([k, t]) => { if (t > (o[k] || 0)) o[k] = t; }); return o; };
+// Same rules as pledges: newer edit wins per campaign, unfollows and "not interested" stick
+const mergeFollows = (a, b) => {
+  if (!b) return tidyFollows(a);
+  const deleted = laterTimes(a && a.deleted, b.deleted);
+  const ignored = laterTimes(a && a.ignored, b.ignored);
+  const byId = {};
+  [...(b.follows || []), ...((a && a.follows) || [])].forEach((f) => {
+    const prev = byId[f.id];
+    if (!prev || (f.updatedAt || 0) >= (prev.updatedAt || 0)) byId[f.id] = f;
+  });
+  return tidyFollows({ ...b, ...(a || {}), follows: Object.values(byId).filter((f) => !deleted[f.id]), deleted, ignored });
+};
+const newsPlatform = (i) => (i.platform && PLATFORMS.includes(i.platform) ? i.platform : i.from === "Gamefound" ? "Gamefound" : "Kickstarter");
+const localDay = (iso) => { const d = new Date(iso); return isNaN(d) ? today() : `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`; };
+// Work out who each email belongs to: a pledge, a followed campaign, or nobody yet.
+// "top" is what shows under New updates (and counts on the Pledges button).
+const sortNews = (news, pledges, followData) => {
+  const follows = followData.follows || [];
+  const pById = Object.fromEntries(pledges.map((p) => [p.id, p]));
+  const fById = Object.fromEntries(follows.map((f) => [f.id, f]));
+  const pByName = Object.fromEntries(pledges.map((p) => [norm(p.name), p]));
+  const fByName = Object.fromEntries(follows.map((f) => [norm(f.name), f]));
+  const ignored = followData.ignored || {};
+  const read = news.read || {};
+  const all = Object.values(news.items || {}).sort((a, b) => (b.date || "").localeCompare(a.date || "")).map((i) => {
+    const ref = i.pledge || i.follow;
+    const p = (ref && pById[ref]) || (!i.pledge ? pByName[norm(i.game)] : null) || null;
+    const f = p ? null : (i.follow && fById[i.follow]) || (!i.pledge ? fByName[norm(i.game)] : null) || null;
+    return { i, p, f, fresh: !read[i.id] };
+  });
+  const top = all.filter(({ i, p, f, fresh }) => fresh && (
+    p ? i.kind !== "backed"
+    : f ? i.kind === "backed"
+    : i.kind === "backed" || (i.kind === "campaign" ? !ignored[norm(i.game)] : !!i.pledge)
+  ));
+  return { all, top };
+};
+
 // One pledge per line: Name | Platform | Pledge manager | Status | USD 999 | details (optional, kept as notes)
 const parsePledgeLines = (text) => {
   const ok = [], bad = [];
@@ -497,10 +548,12 @@ function PledgeEdit({ p, upd, onDelete, onShelve, owned }) {
   );
 }
 
-function Pledges({ store, setStore, onAddToShelf, setToast, syncErr, owned, news, setNews }) {
+function Pledges({ store, setStore, onAddToShelf, setToast, syncErr, owned, news, setNews, followStore, setFollowStore, followSyncErr }) {
   const [openId, setOpenId] = useState(null);
-  const [adding, setAdding] = useState(null); // null | "one" | "paste"
+  const [adding, setAdding] = useState(null); // null | "one" | "paste" | "follow"
   const [draft, setDraft] = useState(null);
+  const [draftFrom, setDraftFrom] = useState(null); // { newsId, followId } when the add form came from an email or a followed campaign
+  const [fdraft, setFdraft] = useState(null);
   const [pasteText, setPasteText] = useState("");
   const [pasteErr, setPasteErr] = useState("");
   const [shelving, setShelving] = useState(null); // { id, name }
@@ -518,11 +571,66 @@ function Pledges({ store, setStore, onAddToShelf, setToast, syncErr, owned, news
   const blank = () => ({ name: "", platform: "Kickstarter", pledgeManager: "none yet", pledgeId: "", status: "Backed", pledgeAmount: "", currency: "USD", backedDate: today(), chargeDate: "", estDelivery: "", tier: "", addOns: "", notes: "" });
   const saveDraft = () => {
     if (!draft.name.trim()) return;
-    const p = { ...draft, id: uid(), name: draft.name.trim(), pledgeAmount: num(String(draft.pledgeAmount).replace(/,/g, "")) || 0, onShelf: false, updatedAt: Date.now() };
+    // A followed campaign keeps its id when it becomes a pledge, so its emails follow it
+    const followId = draftFrom && draftFrom.followId;
+    const p = { ...draft, id: followId || uid(), name: draft.name.trim(), url: fixUrl(draft.url), pledgeAmount: num(String(draft.pledgeAmount).replace(/,/g, "")) || 0, onShelf: false, updatedAt: Date.now() };
     Object.keys(p).forEach((k) => p[k] === "" && delete p[k]);
-    setStore((s) => ({ ...s, pledges: [...(s.pledges || []), p] }));
-    setAdding(null); setDraft(null);
+    setStore((s) => ({ ...s, pledges: [...(s.pledges || []).filter((x) => x.id !== p.id), p] }));
+    if (followId) dropFollow(followId);
+    if (draftFrom && draftFrom.newsId) markRead([draftFrom.newsId]);
+    setAdding(null); setDraft(null); setDraftFrom(null);
     setToast(`Added pledge for ${p.name}`);
+  };
+  const closeForm = () => { setAdding(null); setDraft(null); setDraftFrom(null); setFdraft(null); };
+  // Open the add form filled in from a "You just backed" email or a followed campaign
+  const startPledgeFrom = ({ i, f }) => {
+    setDraft({
+      ...blank(),
+      name: (f && f.name) || i.game || "",
+      platform: f ? f.platform : newsPlatform(i),
+      backedDate: i ? localDay(i.date) : today(),
+      url: (i && i.link) || (f && f.url) || "",
+      notes: (f && f.notes) || "",
+    });
+    setDraftFrom({ newsId: i && i.id, followId: f && f.id });
+    setAdding("one");
+    setOpenId(null);
+    window.scrollTo({ top: 0, behavior: "smooth" });
+  };
+
+  // ---------- Followed campaigns ----------
+  const follows = followStore.follows || [];
+  const updF = (id, fn) => setFollowStore((s) => ({ ...s, follows: (s.follows || []).map((f) => (f.id === id ? { ...fn(f), updatedAt: Date.now() } : f)) }));
+  const dropFollow = (id) => setFollowStore((s) => ({ ...s, follows: (s.follows || []).filter((x) => x.id !== id), deleted: { ...(s.deleted || {}), [id]: Date.now() } }));
+  const addFollow = (f0) => {
+    const f = { id: uid(), name: f0.name.trim(), platform: f0.platform, url: fixUrl(f0.url) || undefined, notes: (f0.notes || "").trim() || undefined, addedAt: localDay(Date.now()), updatedAt: Date.now() };
+    setFollowStore((s) => {
+      const ig = { ...(s.ignored || {}) };
+      delete ig[norm(f.name)];
+      return { ...s, follows: [...(s.follows || []), f], ignored: ig };
+    });
+    setToast(`Following ${f.name}`);
+    return f;
+  };
+  const saveFollowDraft = () => {
+    if (!fdraft.name.trim()) return;
+    if (follows.some((f) => norm(f.name) === norm(fdraft.name)) || list.some((p) => norm(p.name) === norm(fdraft.name))) {
+      setToast(`${fdraft.name.trim()} is already here`);
+      return;
+    }
+    addFollow(fdraft);
+    closeForm();
+  };
+  const unfollow = (f) => {
+    if (!window.confirm(`Stop following ${f.name}? Its emails will stop showing here.`)) return;
+    dropFollow(f.id);
+    setOpenId(null);
+    setToast(`Stopped following ${f.name}`);
+  };
+  const notInterested = (i) => {
+    setFollowStore((s) => ({ ...s, ignored: { ...(s.ignored || {}), [norm(i.game)]: Date.now() } }));
+    markRead([i.id]);
+    setToast(`Hiding emails about ${i.game}`);
   };
   const importPaste = () => {
     const { ok, bad } = parsePledgeLines(pasteText);
@@ -553,31 +661,61 @@ function Pledges({ store, setStore, onAddToShelf, setToast, syncErr, owned, news
   const toShelve = received.filter((p) => !p.onShelf && !p.notShelfItem).length;
 
   // Emails about pledges (from the scheduled Gmail check)
-  const byId = Object.fromEntries(list.map((p) => [p.id, p]));
   const isRead = (i) => !!(news.read || {})[i.id];
-  const emails = Object.values(news.items || {}).sort((a, b) => (b.date || "").localeCompare(a.date || ""));
-  const unread = emails.filter((i) => !isRead(i));
-  const unreadFor = (p) => unread.filter((i) => i.pledge === p.id).length;
+  const sorted = sortNews(news, list, followStore);
+  const unread = sorted.top;
+  // Emails for one pledge or followed campaign (the "You just backed" note itself isn't one of them)
+  const emailsFor = (x) => sorted.all.filter((e) => (e.p === x || e.f === x) && e.i.kind !== "backed");
+  const unreadFor = (x) => emailsFor(x).filter((e) => e.fresh).length;
+  const followNew = follows.reduce((n, f) => n + unreadFor(f), 0);
   const markRead = (ids) => setNews((s) => ({ ...s, read: { ...(s.read || {}), ...Object.fromEntries(ids.map((id) => [id, Date.now()])) } }));
   const applySuggest = (i, p) => {
     upd(p.id, (x) => ({ ...x, status: i.suggest, receivedDate: i.suggest === "Received" ? x.receivedDate || today() : x.receivedDate }));
     markRead([i.id]);
     setToast(`${p.name} set to ${i.suggest}`);
   };
-  const emailCard = (i, compact) => {
-    const p = byId[i.pledge];
+  const emailCard = ({ i, p, f }, compact) => {
     const canSuggest = p && i.suggest && i.suggest !== p.status && PLEDGE_STATUSES.includes(i.suggest) && !isClosed(p);
     const fresh = !isRead(i);
+    const when = <span>{i.date ? fmtDate(i.date.slice(0, 10)) : ""}</span>;
+    // "You just backed X" for a game that isn't a pledge yet
+    if (i.kind === "backed" && !p) return (
+      <div className={`newsitem k-backed${fresh ? "" : " seen"}`} key={i.id}>
+        <div className="nhead"><b>{i.game || "New backing"}</b>{when}</div>
+        <p className="nsubj">You backed this on {newsPlatform(i)}{f ? ". You were following it" : ""}. It isn't in your pledges yet.</p>
+        <div className="nact">
+          <span className="pill nk-backed">New backing</span>
+          {i.mail && <a className="plink" href={i.mail} target="_blank" rel="noreferrer">Email ↗</a>}
+          <button className="btn felt" onClick={() => startPledgeFrom({ i, f })}>Add as pledge</button>
+          {fresh && <button className="btn ghost" onClick={() => markRead([i.id])}>Dismiss</button>}
+        </div>
+      </div>
+    );
+    // An update from a campaign that's neither a pledge nor followed
+    if (i.kind === "campaign" && !p && !f) return (
+      <div className={`newsitem k-campaign${fresh ? "" : " seen"}`} key={i.id}>
+        <div className="nhead"><b>{i.game || "Campaign"}</b>{when}</div>
+        <p className="nsubj">{i.subject}</p>
+        {i.summary && <p className="hint" style={{ margin: 0 }}>{i.summary}</p>}
+        <p className="hint" style={{ margin: 0 }}>You're not backing or following this campaign.</p>
+        <div className="nact">
+          {i.link && <a className="plink" href={i.link} target="_blank" rel="noreferrer">Open update ↗</a>}
+          {i.mail && <a className="plink" href={i.mail} target="_blank" rel="noreferrer">Email ↗</a>}
+          <button className="btn felt" onClick={() => addFollow({ name: i.game, platform: newsPlatform(i), url: i.project || "" })}>Follow it</button>
+          <button className="btn ghost" onClick={() => notInterested(i)}>Not interested</button>
+        </div>
+      </div>
+    );
     return (
-      <div className={`newsitem k-${i.kind || "update"}${fresh ? "" : " seen"}`} key={i.id}>
+      <div className={`newsitem k-${i.kind && i.kind !== "campaign" ? i.kind : "update"}${fresh ? "" : " seen"}`} key={i.id}>
         <div className="nhead">
-          <b>{compact ? i.subject : p ? p.name : i.game || "Pledge"}</b>
-          <span>{i.date ? fmtDate(i.date.slice(0, 10)) : ""}</span>
+          <b>{compact ? i.subject : p ? p.name : f ? f.name : i.game || "Pledge"}</b>
+          {when}
         </div>
         {!compact && <p className="nsubj">{i.subject}</p>}
         {i.summary && <p className="hint" style={{ margin: 0 }}>{i.summary}</p>}
         <div className="nact">
-          {i.kind && i.kind !== "update" && <span className={`pill nk-${i.kind}`}>{NEWS_KINDS[i.kind] || i.kind}</span>}
+          {i.kind && !["update", "campaign"].includes(i.kind) && <span className={`pill nk-${i.kind}`}>{NEWS_KINDS[i.kind] || i.kind}</span>}
           {i.link && <a className="plink" href={i.link} target="_blank" rel="noreferrer">Open update ↗</a>}
           {i.mail && <a className="plink" href={i.mail} target="_blank" rel="noreferrer">Email ↗</a>}
           {canSuggest && <button className="btn felt" onClick={() => applySuggest(i, p)}>Set to {i.suggest}</button>}
@@ -640,16 +778,63 @@ function Pledges({ store, setStore, onAddToShelf, setToast, syncErr, owned, news
             {p.status === "Received" && <button className="x" style={{ color: "var(--muted)" }} onClick={() => upd(p.id, (x) => ({ ...x, notShelfItem: true, onShelf: false }))}>Not a shelf item</button>}
           </div>
         ) : null}
-        {isOpen && emails.some((i) => i.pledge === p.id) && (
+        {isOpen && emailsFor(p).length > 0 && (
           <div style={{ display: "grid", gap: 6, paddingTop: 10 }}>
             <label className="f" style={{ margin: 0 }}>Recent emails</label>
-            {emails.filter((i) => i.pledge === p.id).slice(0, 6).map((i) => emailCard(i, true))}
+            {emailsFor(p).slice(0, 6).map((e) => emailCard(e, true))}
           </div>
         )}
         {isOpen && <PledgeEdit key={p.id} p={p} upd={upd} owned={ownedSorted} onDelete={() => removeP(p)} onShelve={() => startShelve(p)} />}
       </div>
     );
   };
+  const followCard = (f) => {
+    const isOpen = openId === f.id;
+    const n = unreadFor(f);
+    const mine = emailsFor(f);
+    return (
+      <div className="pledge follow" key={f.id} id={`f-${f.id}`}>
+        <button className="name" aria-expanded={isOpen} onClick={() => setOpenId(isOpen ? null : f.id)}>
+          <b>{f.name}</b>
+          <span>{f.platform}{f.addedAt ? ` · following since ${fmtDate(f.addedAt)}` : ""}</span>
+        </button>
+        {(n > 0 || f.url) && (
+          <div className="pmeta">
+            {n > 0 && <span className="pill newp">{n} new</span>}
+            {f.url && <a className="plink" href={f.url} target="_blank" rel="noreferrer">Open on {linkSite(f.url)} ↗</a>}
+          </div>
+        )}
+        {f.notes && !isOpen ? <p className="hint" style={{ margin: 0 }}>{f.notes}</p> : null}
+        {isOpen && mine.length > 0 && (
+          <div style={{ display: "grid", gap: 6, paddingTop: 4 }}>
+            <div className="newshead">
+              <label className="f" style={{ margin: 0 }}>Recent emails</label>
+              {n > 0 && <button className="x" onClick={() => markRead(mine.filter((e) => e.fresh).map((e) => e.i.id))}>Mark all read</button>}
+            </div>
+            {mine.slice(0, 6).map((e) => emailCard(e, true))}
+          </div>
+        )}
+        {isOpen && (
+          <div className="detail" style={{ padding: "8px 0 0" }}>
+            <label className="f">Campaign<input value={f.name} onChange={(e) => updF(f.id, (x) => ({ ...x, name: e.target.value }))} /></label>
+            <label className="f">On
+              <select value={f.platform} onChange={(e) => updF(f.id, (x) => ({ ...x, platform: e.target.value }))}>{PLATFORMS.map((x) => <option key={x}>{x}</option>)}</select>
+            </label>
+            <label className="f">Campaign link
+              <input type="url" inputMode="url" defaultValue={f.url || ""} placeholder="Paste the campaign page address" autoCapitalize="off" autoCorrect="off"
+                onBlur={(e) => { const u = fixUrl(e.target.value); e.target.value = u; updF(f.id, (x) => ({ ...x, url: u || undefined })); }} />
+            </label>
+            <label className="f">Notes<textarea style={{ minHeight: 60 }} value={f.notes || ""} placeholder="Launch date, what you're waiting to see…" onChange={(e) => updF(f.id, (x) => ({ ...x, notes: e.target.value }))} /></label>
+            <div className="bar" style={{ margin: 0, flexWrap: "wrap" }}>
+              <button className="btn felt" onClick={() => startPledgeFrom({ f })}>I backed it</button>
+              <button className="x" onClick={() => unfollow(f)}>Unfollow</button>
+            </div>
+          </div>
+        )}
+      </div>
+    );
+  };
+  const followsSorted = [...follows].sort((a, b) => unreadFor(b) - unreadFor(a) || a.name.localeCompare(b.name));
   const section = (title, items, hint) => items.length > 0 && (
     <React.Fragment key={title}>
       <h2>{title} ({items.length})</h2>
@@ -661,6 +846,21 @@ function Pledges({ store, setStore, onAddToShelf, setToast, syncErr, owned, news
   return (
     <>
       {syncErr && <div className="msg" role="status">Pledges didn't sync: {syncErr}</div>}
+      {followSyncErr && !syncErr && <div className="msg" role="status">Followed campaigns didn't sync: {followSyncErr}</div>}
+
+      {adding === "follow" && fdraft ? (
+        <div className="sheet">
+          <label className="f">Campaign<input autoFocus value={fdraft.name} onChange={(e) => setFdraft({ ...fdraft, name: e.target.value })} /></label>
+          <label className="f">On<select value={fdraft.platform} onChange={(e) => setFdraft({ ...fdraft, platform: e.target.value })}>{PLATFORMS.map((x) => <option key={x}>{x}</option>)}</select></label>
+          <label className="f">Campaign link<input type="url" inputMode="url" value={fdraft.url} placeholder="Optional" autoCapitalize="off" autoCorrect="off" onChange={(e) => setFdraft({ ...fdraft, url: e.target.value })} /></label>
+          <label className="f">Notes<input value={fdraft.notes} placeholder="Optional, e.g. launches in March" onChange={(e) => setFdraft({ ...fdraft, notes: e.target.value })} /></label>
+          <p className="hint" style={{ margin: 0 }}>For campaigns you're watching but haven't backed. No money is tracked, and their update emails show under Following.</p>
+          <div className="bar" style={{ margin: 0 }}>
+            <button className="btn" disabled={!fdraft.name.trim()} onClick={saveFollowDraft}>Follow</button>
+            <button className="btn ghost" onClick={closeForm}>Cancel</button>
+          </div>
+        </div>
+      ) : null}
 
       {adding === "one" && draft ? (
         <div className="sheet">
@@ -680,10 +880,14 @@ function Pledges({ store, setStore, onAddToShelf, setToast, syncErr, owned, news
             <label className="f">Charge date<input type="date" value={draft.chargeDate} onChange={(e) => setDraft({ ...draft, chargeDate: e.target.value })} /></label>
           </div>
           <label className="f">Estimated delivery<input type="month" value={draft.estDelivery} onChange={(e) => setDraft({ ...draft, estDelivery: e.target.value })} /></label>
-          <p className="hint" style={{ margin: 0 }}>Everything else (ID, add-ons, extra charges, notes) can be filled in by tapping the pledge after adding it.</p>
+          <label className="f">Pledge link<input type="url" inputMode="url" value={draft.url || ""} placeholder="Optional" autoCapitalize="off" autoCorrect="off" onChange={(e) => setDraft({ ...draft, url: e.target.value })} /></label>
+          <p className="hint" style={{ margin: 0 }}>
+            {draftFrom && draftFrom.followId ? "This moves the campaign from Following to your pledges. " : draftFrom && draftFrom.newsId ? "Filled in from the email. Check the name and add the amount. " : ""}
+            Everything else (ID, add-ons, extra charges, notes) can be filled in by tapping the pledge after adding it.
+          </p>
           <div className="bar" style={{ margin: 0 }}>
             <button className="btn" disabled={!draft.name.trim()} onClick={saveDraft}>Add pledge</button>
-            <button className="btn ghost" onClick={() => { setAdding(null); setDraft(null); }}>Cancel</button>
+            <button className="btn ghost" onClick={closeForm}>Cancel</button>
           </div>
         </div>
       ) : adding === "paste" ? (
@@ -698,9 +902,10 @@ function Pledges({ store, setStore, onAddToShelf, setToast, syncErr, owned, news
             <button className="btn ghost" onClick={() => { setAdding(null); setPasteErr(""); }}>Cancel</button>
           </div>
         </div>
-      ) : (
-        <div className="bar">
-          <button className="btn" onClick={() => { setAdding("one"); setDraft(blank()); }}>Add a pledge</button>
+      ) : adding ? null : (
+        <div className="bar" style={{ flexWrap: "wrap" }}>
+          <button className="btn" onClick={() => { setAdding("one"); setDraft(blank()); setDraftFrom(null); }}>Add a pledge</button>
+          <button className="btn ghost" onClick={() => { setAdding("follow"); setFdraft({ name: "", platform: "Kickstarter", url: "", notes: "" }); }}>Follow a campaign</button>
           <button className="btn ghost" onClick={() => setAdding("paste")}>Paste a list</button>
         </div>
       )}
@@ -713,11 +918,19 @@ function Pledges({ store, setStore, onAddToShelf, setToast, syncErr, owned, news
         <section className="news">
           <div className="newshead">
             <h2>New updates ({unread.length})</h2>
-            <button className="x" onClick={() => { markRead(unread.map((i) => i.id)); setToast("All marked read"); }}>Mark all read</button>
+            <button className="x" onClick={() => { markRead(unread.map((e) => e.i.id)); setToast("All marked read"); }}>Mark all read</button>
           </div>
           <p className="hint">From your pledge emails, checked twice a day. Marking one read clears it on both phones.</p>
-          <div className="list">{unread.map((i) => emailCard(i, false))}</div>
+          <div className="list">{unread.map((e) => emailCard(e, false))}</div>
         </section>
+      )}
+
+      {follows.length > 0 && (
+        <details className="more following">
+          <summary>Following ({follows.length}){followNew ? <small> · {followNew} new update{followNew === 1 ? "" : "s"}</small> : <small> · not backed</small>}</summary>
+          <p className="hint" style={{ marginTop: 0 }}>Campaigns you're watching. Not counted as pledges.</p>
+          <div className="list">{followsSorted.map(followCard)}</div>
+        </details>
       )}
 
       {needs.length > 0 && (
@@ -968,6 +1181,12 @@ details.more details.more{background:var(--card)}
 .newsitem.k-shipping{border-left-color:var(--felt)}
 .newsitem.k-payment{border-left-color:#AFBDD9}
 .newsitem.seen{opacity:.7}
+.newsitem.k-backed{border-left-color:#AFBDD9}
+.newsitem.k-campaign{border-left-color:#C9B8D9;border-style:dashed solid dashed solid}
+.pill.nk-backed{background:#DCE3F2;border-color:#AFBDD9}
+details.more.following{margin:0 0 6px;border:2px solid #C9B8D9;background:#F4EEF8;border-radius:12px}
+details.more.following .list{margin-top:6px}
+.pledge.follow{border-left:5px solid #C9B8D9}
 .nhead{display:flex;justify-content:space-between;gap:10px;align-items:baseline}
 .nhead b{min-width:0;overflow-wrap:anywhere}
 .nhead span{color:var(--muted);font-size:13px;white-space:nowrap}
@@ -1016,6 +1235,10 @@ details.more details.more{background:var(--card)}
 .msg{background:#FFF4D6;border-left:4px solid var(--meeple);padding:10px 12px;border-radius:6px;margin-bottom:12px;font-size:15px}
 .empty{text-align:center;padding:36px 16px;color:var(--muted)}
 .sheet{background:var(--card);border:2px solid var(--ink);border-radius:12px;padding:14px;display:grid;gap:10px;margin-bottom:14px}
+.sheet{grid-template-columns:minmax(0,1fr)}
+.sheet>*,.sheet .two>*{min-width:0}
+.sheet .two{grid-template-columns:minmax(0,1fr) minmax(0,1fr)}
+.sheet input,.sheet select{max-width:100%;min-width:0}
 .toast{position:fixed;left:50%;bottom:max(20px,env(safe-area-inset-bottom));transform:translateX(-50%);background:var(--ink);color:var(--paper);padding:10px 16px;border-radius:999px;font-weight:600;font-size:14px;max-width:90vw}
 .credit{font-size:13px;color:var(--muted);margin-top:18px}
 details{margin-top:24px;color:var(--muted);font-size:14px}
@@ -1995,6 +2218,8 @@ function App() {
   const [view, setView] = useState("shelf"); // "shelf" | "pledges"
   const [pledgeData, setPledgeData] = useState({ pledges: [], deleted: {} });
   const [pledgeSyncErr, setPledgeSyncErr] = useState("");
+  const [followData, setFollowData] = useState({ follows: [], deleted: {}, ignored: {} });
+  const [followSyncErr, setFollowSyncErr] = useState("");
   const [news, setNews] = useState({ items: {}, read: {} });
   const [open, setOpen] = useState(null);
   const [adding, setAdding] = useState(false);
@@ -2033,6 +2258,8 @@ function App() {
   const pledgeRef = useRef(pledgeData); pledgeRef.current = pledgeData;
   const lastPledgeSynced = useRef("");
   const newsRef = useRef(news); newsRef.current = news;
+  const followRef = useRef(followData); followRef.current = followData;
+  const lastFollowSynced = useRef("");
   const lastNewsSynced = useRef("");
   const cfgRef = useRef(null);
   const lastSynced = useRef("");
@@ -2062,6 +2289,10 @@ function App() {
         if (nr && nr.value) setNews(tidyNews(JSON.parse(nr.value)));
       } catch (e) { /* no pledge emails yet */ }
       try {
+        const fr = await window.storage.get(FOLLOW_KEY);
+        if (fr && fr.value) setFollowData(tidyFollows(JSON.parse(fr.value)));
+      } catch (e) { /* not following anything yet */ }
+      try {
         const s = await window.storage.get(SYNC_KEY);
         if (s && s.value) { const cfg = JSON.parse(s.value); cfgRef.current = cfg; setSyncCfg(cfg); }
       } catch (e) { /* sync not set up */ }
@@ -2077,7 +2308,12 @@ function App() {
 
   // Check for the other phone's changes when the app comes back into view, and every minute while open
   useEffect(() => {
-    const onVis = () => { if (document.visibilityState === "visible" && cfgRef.current) schedule(200); };
+    const onVis = () => {
+      if (!cfgRef.current) return;
+      if (document.visibilityState === "visible") schedule(200);
+      // Leaving the app with a change still waiting to sync: send it now instead of when the app is next opened
+      else if (timerRef.current) { clearTimeout(timerRef.current); timerRef.current = null; runSync(); }
+    };
     document.addEventListener("visibilitychange", onVis);
     const t = setInterval(() => { if (document.visibilityState === "visible" && cfgRef.current) schedule(0); }, 60000);
     return () => { document.removeEventListener("visibilitychange", onVis); clearInterval(t); };
@@ -2094,6 +2330,12 @@ function App() {
     window.storage.set(NEWS_KEY, JSON.stringify(news)).catch(() => {});
     if (cfgRef.current && canonNews(news) !== lastNewsSynced.current) schedule(lastNewsSynced.current ? 3000 : 300);
   }, [news, loaded]);
+
+  useEffect(() => {
+    if (!loaded) return;
+    window.storage.set(FOLLOW_KEY, JSON.stringify(followData)).catch(() => setMsg("Couldn't save your last change to Following. Try again in a moment."));
+    if (cfgRef.current && canonFollows(followData) !== lastFollowSynced.current) schedule(lastFollowSynced.current ? 3000 : 300);
+  }, [followData, loaded]);
 
   // Pledges get their own background so it's always clear which side you're on
   useEffect(() => {
@@ -2136,7 +2378,7 @@ function App() {
   // ---------- Sync ----------
   const schedule = (ms) => {
     clearTimeout(timerRef.current);
-    timerRef.current = setTimeout(() => runSync(), ms);
+    timerRef.current = setTimeout(() => { timerRef.current = null; runSync(); }, ms);
   };
   const runSync = async (attempt = 0) => {
     const cfg = cfgRef.current;
@@ -2188,6 +2430,7 @@ function App() {
     // Pledges sync after the shelf, on their own, so a problem here can never hold up or touch shelf.json
     await syncPledges(cfg);
     await syncNews(cfg);
+    await syncFollows(cfg);
     busyRef.current = false;
     if (againRef.current) { againRef.current = false; schedule(500); }
   };
@@ -2220,6 +2463,22 @@ function App() {
       if ((e.status === 409 || e.status === 422) && attempt < 2) return syncNews(cfg, attempt + 1);
     }
   };
+  // Followed campaigns: their own file, same pattern; never touches the shelf or pledges
+  const syncFollows = async (cfg, attempt = 0) => {
+    try {
+      const remote = await ghGet(cfg, FOLLOW_FILE);
+      const merged = mergeFollows(followRef.current, remote ? remote.json : null);
+      const mergedCanon = canonFollows(merged);
+      const empty = !merged.follows.length && !Object.keys(merged.deleted).length && !Object.keys(merged.ignored).length;
+      if (remote ? mergedCanon !== canonFollows(remote.json) : !empty) await ghPut(cfg, FOLLOW_FILE, merged, remote && remote.sha);
+      lastFollowSynced.current = mergedCanon;
+      setFollowData((cur) => mergeFollows(cur, merged));
+      setFollowSyncErr("");
+    } catch (e) {
+      if ((e.status === 409 || e.status === 422) && attempt < 2) return syncFollows(cfg, attempt + 1);
+      setFollowSyncErr(syncError(e));
+    }
+  };
   const connectSync = async (cfg) => {
     const clean = { repo: cfg.repo.trim().replace(/^https?:\/\/github\.com\//i, "").replace(/\/+$/, ""), token: cfg.token.trim() };
     setSync({ state: "syncing" });
@@ -2233,6 +2492,7 @@ function App() {
       lastSynced.current = "";
       lastPledgeSynced.current = "";
       lastNewsSynced.current = "";
+      lastFollowSynced.current = "";
       setSyncCfg(clean);
       setRepoDraft(""); setTokenDraft(""); setCodeDraft("");
       setToast("Connected. Syncing your shelf…");
@@ -2618,7 +2878,7 @@ function App() {
 
   const openPledges = pledgeData.pledges.filter((p) => !isClosed(p));
   const pledgeActions = openPledges.filter((p) => p.status === "PM open").length;
-  const newsUnread = Object.keys(news.items || {}).filter((id) => !(news.read || {})[id]).length;
+  const newsUnread = sortNews(news, pledgeData.pledges || [], followData).top.length;
   return (
     <div className={`bg${view === "pledges" ? " pl" : ""}`}>
       <div className={`app${view === "pledges" ? " pl" : ""}`}>
@@ -2641,7 +2901,7 @@ function App() {
 
         {msg && <div className="msg" role="status">{msg} <button className="x" onClick={() => setMsg("")}>Dismiss</button></div>}
 
-        {view === "pledges" && <Pledges store={pledgeData} setStore={setPledgeData} onAddToShelf={addPledgeToShelf} owned={owned} setToast={setToast} syncErr={syncCfg ? pledgeSyncErr : ""} news={news} setNews={setNews} />}
+        {view === "pledges" && <Pledges store={pledgeData} setStore={setPledgeData} onAddToShelf={addPledgeToShelf} owned={owned} setToast={setToast} syncErr={syncCfg ? pledgeSyncErr : ""} news={news} setNews={setNews} followStore={followData} setFollowStore={setFollowData} followSyncErr={syncCfg ? followSyncErr : ""} />}
 
         {view === "shelf" && (<>
         <div className="tabs" role="tablist">
