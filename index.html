@@ -62,7 +62,7 @@ window.addEventListener("error", function (e) {
 <script type="text/babel" data-presets="react">
 const { useState, useEffect, useMemo, useRef } = React;
 
-const APP_VERSION = "2.8";
+const APP_VERSION = "2.9";
 const KEY = "boardgame-shelf-v1";
 const ART_KEY = "boardgame-art-v1";
 const SYNC_KEY = "boardgame-sync-v1";
@@ -424,6 +424,14 @@ const mergeFollows = (a, b) => {
 };
 const newsPlatform = (i) => (i.platform && PLATFORMS.includes(i.platform) ? i.platform : i.from === "Gamefound" ? "Gamefound" : "Kickstarter");
 const localDay = (iso) => { const d = new Date(iso); return isNaN(d) ? today() : `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`; };
+// An email counts as new until it's marked read, and again if the email check rebuilt it afterwards
+const isFresh = (i, read) => !read[i.id] || (!!i.updated && read[i.id] < i.updated);
+// "Ends Nov 19 (in 6 days)" for a campaign close date
+const endsLine = (d) => {
+  if (!d || !/^\d{4}-\d{2}-\d{2}$/.test(d)) return "";
+  const n = Math.round((new Date(d + "T12:00:00") - new Date(localDay(Date.now()) + "T12:00:00")) / 86400000);
+  return n < 0 ? `Ended ${fmtDate(d)}` : n === 0 ? "Ends today" : n === 1 ? "Ends tomorrow" : `Ends ${fmtDate(d)}${n <= 30 ? ` (in ${n} days)` : ""}`;
+};
 // Work out who each email belongs to: a pledge, a followed campaign, or nobody yet.
 // "top" is what shows under New updates (and counts on the Pledges button).
 const sortNews = (news, pledges, followData) => {
@@ -438,7 +446,7 @@ const sortNews = (news, pledges, followData) => {
     const ref = i.pledge || i.follow;
     const p = (ref && pById[ref]) || (!i.pledge ? pByName[norm(i.game)] : null) || null;
     const f = p ? null : (i.follow && fById[i.follow]) || (!i.pledge ? fByName[norm(i.game)] : null) || null;
-    return { i, p, f, fresh: !read[i.id] };
+    return { i, p, f, fresh: isFresh(i, read) };
   });
   const top = all.filter(({ i, p, f, fresh }) => fresh && (
     p ? i.kind !== "backed"
@@ -584,12 +592,23 @@ function Pledges({ store, setStore, onAddToShelf, setToast, syncErr, owned, news
   const closeForm = () => { setAdding(null); setDraft(null); setDraftFrom(null); setFdraft(null); };
   // Open the add form filled in from a "You just backed" email or a followed campaign
   const startPledgeFrom = ({ i, f }) => {
+    const d = i || {};
+    const ymd = (v) => (/^\d{4}-\d{2}-\d{2}$/.test(v || "") ? v : "");
     setDraft({
       ...blank(),
-      name: (f && f.name) || i.game || "",
-      platform: f ? f.platform : newsPlatform(i),
-      backedDate: i ? localDay(i.date) : today(),
-      url: (i && i.link) || (f && f.url) || "",
+      name: (f && f.name) || d.game || "",
+      platform: f ? f.platform : newsPlatform(d),
+      pledgeManager: (f ? f.platform : newsPlatform(d)) === "Gamefound" ? "Gamefound" : "none yet",
+      backedDate: i ? localDay(d.date) : localDay(Date.now()),
+      // Details the email check read from the backing email, when it had them
+      pledgeAmount: typeof d.amount === "number" ? String(d.amount) : "",
+      currency: d.currency || "USD",
+      tier: d.tier || "",
+      addOns: d.addOns || "",
+      chargeDate: ymd(d.chargeDate),
+      estDelivery: /^\d{4}-\d{2}$/.test(d.estDelivery || "") ? d.estDelivery : "",
+      pledgeId: d.pledgeId || "",
+      url: d.project || d.link || (f && f.url) || "",
       notes: (f && f.notes) || "",
     });
     setDraftFrom({ newsId: i && i.id, followId: f && f.id });
@@ -603,7 +622,7 @@ function Pledges({ store, setStore, onAddToShelf, setToast, syncErr, owned, news
   const updF = (id, fn) => setFollowStore((s) => ({ ...s, follows: (s.follows || []).map((f) => (f.id === id ? { ...fn(f), updatedAt: Date.now() } : f)) }));
   const dropFollow = (id) => setFollowStore((s) => ({ ...s, follows: (s.follows || []).filter((x) => x.id !== id), deleted: { ...(s.deleted || {}), [id]: Date.now() } }));
   const addFollow = (f0) => {
-    const f = { id: uid(), name: f0.name.trim(), platform: f0.platform, url: fixUrl(f0.url) || undefined, notes: (f0.notes || "").trim() || undefined, addedAt: localDay(Date.now()), updatedAt: Date.now() };
+    const f = { id: uid(), name: f0.name.trim(), platform: f0.platform, url: fixUrl(f0.url) || undefined, endsAt: /^\d{4}-\d{2}-\d{2}$/.test(f0.endsAt || "") ? f0.endsAt : undefined, notes: (f0.notes || "").trim() || undefined, addedAt: localDay(Date.now()), updatedAt: Date.now() };
     setFollowStore((s) => {
       const ig = { ...(s.ignored || {}) };
       delete ig[norm(f.name)];
@@ -661,7 +680,13 @@ function Pledges({ store, setStore, onAddToShelf, setToast, syncErr, owned, news
   const toShelve = received.filter((p) => !p.onShelf && !p.notShelfItem).length;
 
   // Emails about pledges (from the scheduled Gmail check)
-  const isRead = (i) => !!(news.read || {})[i.id];
+  const isRead = (i) => !isFresh(i, news.read || {});
+  // A followed campaign's link and close date: what you entered, else the newest email that mentions them
+  const followInfo = (f) => {
+    const mine = sorted.all.filter((e) => e.f === f);
+    const fromMail = (k) => (mine.find((e) => e.i[k]) || { i: {} }).i[k] || "";
+    return { url: f.url || fromMail("project"), endsAt: f.endsAt || fromMail("endsAt"), urlFromMail: !f.url && !!fromMail("project"), endsFromMail: !f.endsAt && !!fromMail("endsAt") };
+  };
   const sorted = sortNews(news, list, followStore);
   const unread = sorted.top;
   // Emails for one pledge or followed campaign (the "You just backed" note itself isn't one of them)
@@ -683,6 +708,11 @@ function Pledges({ store, setStore, onAddToShelf, setToast, syncErr, owned, news
       <div className={`newsitem k-backed${fresh ? "" : " seen"}`} key={i.id}>
         <div className="nhead"><b>{i.game || "New backing"}</b>{when}</div>
         <p className="nsubj">You backed this on {newsPlatform(i)}{f ? ". You were following it" : ""}. It isn't in your pledges yet.</p>
+        {(typeof i.amount === "number" || i.tier || i.chargeDate || i.estDelivery) && (
+          <p className="hint" style={{ margin: 0 }}>
+            {[typeof i.amount === "number" ? fmtMoney(i.amount, i.currency) : "", i.tier, i.chargeDate ? `charges ${fmtDate(i.chargeDate)}` : "", i.estDelivery ? `est. ${fmtMonth(i.estDelivery)}` : ""].filter(Boolean).join(" · ")}
+          </p>
+        )}
         <div className="nact">
           <span className="pill nk-backed">New backing</span>
           {i.mail && <a className="plink" href={i.mail} target="_blank" rel="noreferrer">Email ↗</a>}
@@ -697,11 +727,12 @@ function Pledges({ store, setStore, onAddToShelf, setToast, syncErr, owned, news
         <div className="nhead"><b>{i.game || "Campaign"}</b>{when}</div>
         <p className="nsubj">{i.subject}</p>
         {i.summary && <p className="hint" style={{ margin: 0 }}>{i.summary}</p>}
-        <p className="hint" style={{ margin: 0 }}>You're not backing or following this campaign.</p>
+        <p className="hint" style={{ margin: 0 }}>You're not backing or following this campaign.{i.endsAt ? ` ${endsLine(i.endsAt)}.` : ""}</p>
         <div className="nact">
           {i.link && <a className="plink" href={i.link} target="_blank" rel="noreferrer">Open update ↗</a>}
+          {i.project && !i.link && <a className="plink" href={i.project} target="_blank" rel="noreferrer">Open on {linkSite(i.project)} ↗</a>}
           {i.mail && <a className="plink" href={i.mail} target="_blank" rel="noreferrer">Email ↗</a>}
-          <button className="btn felt" onClick={() => addFollow({ name: i.game, platform: newsPlatform(i), url: i.project || "" })}>Follow it</button>
+          <button className="btn felt" onClick={() => addFollow({ name: i.game, platform: newsPlatform(i), url: i.project || "", endsAt: i.endsAt || "" })}>Follow it</button>
           <button className="btn ghost" onClick={() => notInterested(i)}>Not interested</button>
         </div>
       </div>
@@ -792,16 +823,19 @@ function Pledges({ store, setStore, onAddToShelf, setToast, syncErr, owned, news
     const isOpen = openId === f.id;
     const n = unreadFor(f);
     const mine = emailsFor(f);
+    const info = followInfo(f);
+    const ends = endsLine(info.endsAt);
     return (
       <div className="pledge follow" key={f.id} id={`f-${f.id}`}>
         <button className="name" aria-expanded={isOpen} onClick={() => setOpenId(isOpen ? null : f.id)}>
           <b>{f.name}</b>
           <span>{f.platform}{f.addedAt ? ` · following since ${fmtDate(f.addedAt)}` : ""}</span>
+          {ends ? <span className={`ends${/^Ended/.test(ends) ? " over" : ""}`}>{ends}</span> : null}
         </button>
-        {(n > 0 || f.url) && (
+        {(n > 0 || info.url) && (
           <div className="pmeta">
             {n > 0 && <span className="pill newp">{n} new</span>}
-            {f.url && <a className="plink" href={f.url} target="_blank" rel="noreferrer">Open on {linkSite(f.url)} ↗</a>}
+            {info.url && <a className="plink" href={info.url} target="_blank" rel="noreferrer">Open on {linkSite(info.url)} ↗</a>}
           </div>
         )}
         {f.notes && !isOpen ? <p className="hint" style={{ margin: 0 }}>{f.notes}</p> : null}
@@ -824,9 +858,14 @@ function Pledges({ store, setStore, onAddToShelf, setToast, syncErr, owned, news
               <input type="url" inputMode="url" defaultValue={f.url || ""} placeholder="Paste the campaign page address" autoCapitalize="off" autoCorrect="off"
                 onBlur={(e) => { const u = fixUrl(e.target.value); e.target.value = u; updF(f.id, (x) => ({ ...x, url: u || undefined })); }} />
             </label>
+            {info.urlFromMail && <p className="hint" style={{ margin: "-6px 0 0" }}>Using the link from an email. Paste one here to change it.</p>}
+            <label className="f">Campaign ends
+              <input type="date" value={f.endsAt || ""} onChange={(e) => updF(f.id, (x) => ({ ...x, endsAt: e.target.value || undefined }))} />
+            </label>
+            {info.endsFromMail && <p className="hint" style={{ margin: "-6px 0 0" }}>From an email: {fmtDate(info.endsAt)}. Pick a date to change it.</p>}
             <label className="f">Notes<textarea style={{ minHeight: 60 }} value={f.notes || ""} placeholder="Launch date, what you're waiting to see…" onChange={(e) => updF(f.id, (x) => ({ ...x, notes: e.target.value }))} /></label>
             <div className="bar" style={{ margin: 0, flexWrap: "wrap" }}>
-              <button className="btn felt" onClick={() => startPledgeFrom({ f })}>I backed it</button>
+              <button className="btn felt" onClick={() => startPledgeFrom({ f: { ...f, url: info.url } })}>I backed it</button>
               <button className="x" onClick={() => unfollow(f)}>Unfollow</button>
             </div>
           </div>
@@ -834,7 +873,10 @@ function Pledges({ store, setStore, onAddToShelf, setToast, syncErr, owned, news
       </div>
     );
   };
-  const followsSorted = [...follows].sort((a, b) => unreadFor(b) - unreadFor(a) || a.name.localeCompare(b.name));
+  // Soonest close date first; ended campaigns and ones with no date after
+  const todayYmd = localDay(Date.now());
+  const endKey = (f) => { const d = followInfo(f).endsAt; return !d ? "8" : d < todayYmd ? "9" + d : "0" + d; };
+  const followsSorted = [...follows].sort((a, b) => endKey(a).localeCompare(endKey(b)) || a.name.localeCompare(b.name));
   const section = (title, items, hint) => items.length > 0 && (
     <React.Fragment key={title}>
       <h2>{title} ({items.length})</h2>
@@ -853,6 +895,7 @@ function Pledges({ store, setStore, onAddToShelf, setToast, syncErr, owned, news
           <label className="f">Campaign<input autoFocus value={fdraft.name} onChange={(e) => setFdraft({ ...fdraft, name: e.target.value })} /></label>
           <label className="f">On<select value={fdraft.platform} onChange={(e) => setFdraft({ ...fdraft, platform: e.target.value })}>{PLATFORMS.map((x) => <option key={x}>{x}</option>)}</select></label>
           <label className="f">Campaign link<input type="url" inputMode="url" value={fdraft.url} placeholder="Optional" autoCapitalize="off" autoCorrect="off" onChange={(e) => setFdraft({ ...fdraft, url: e.target.value })} /></label>
+          <label className="f">Campaign ends<input type="date" value={fdraft.endsAt || ""} onChange={(e) => setFdraft({ ...fdraft, endsAt: e.target.value })} /></label>
           <label className="f">Notes<input value={fdraft.notes} placeholder="Optional, e.g. launches in March" onChange={(e) => setFdraft({ ...fdraft, notes: e.target.value })} /></label>
           <p className="hint" style={{ margin: 0 }}>For campaigns you're watching but haven't backed. No money is tracked, and their update emails show under Following.</p>
           <div className="bar" style={{ margin: 0 }}>
@@ -871,9 +914,10 @@ function Pledges({ store, setStore, onAddToShelf, setToast, syncErr, owned, news
           </div>
           <label className="f">Status<select value={draft.status} onChange={(e) => setDraft({ ...draft, status: e.target.value })}>{PLEDGE_STATUSES.filter((x) => x !== "Received").map((x) => <option key={x}>{x}</option>)}</select></label>
           <label className="f">Tier<input value={draft.tier} onChange={(e) => setDraft({ ...draft, tier: e.target.value })} /></label>
+          {draft.addOns ? <label className="f">Add-ons<input value={draft.addOns} onChange={(e) => setDraft({ ...draft, addOns: e.target.value })} /></label> : null}
           <div className="two">
             <label className="f">Pledge amount<input inputMode="decimal" value={draft.pledgeAmount} onChange={(e) => setDraft({ ...draft, pledgeAmount: e.target.value })} /></label>
-            <label className="f">Currency<select value={draft.currency} onChange={(e) => setDraft({ ...draft, currency: e.target.value })}>{CURRENCIES.map((x) => <option key={x}>{x}</option>)}</select></label>
+            <label className="f">Currency<select value={draft.currency} onChange={(e) => setDraft({ ...draft, currency: e.target.value })}>{[...new Set([...CURRENCIES, draft.currency])].map((x) => <option key={x}>{x}</option>)}</select></label>
           </div>
           <div className="two">
             <label className="f">Backed<input type="date" value={draft.backedDate} onChange={(e) => setDraft({ ...draft, backedDate: e.target.value })} /></label>
@@ -905,7 +949,7 @@ function Pledges({ store, setStore, onAddToShelf, setToast, syncErr, owned, news
       ) : adding ? null : (
         <div className="bar" style={{ flexWrap: "wrap" }}>
           <button className="btn" onClick={() => { setAdding("one"); setDraft(blank()); setDraftFrom(null); }}>Add a pledge</button>
-          <button className="btn ghost" onClick={() => { setAdding("follow"); setFdraft({ name: "", platform: "Kickstarter", url: "", notes: "" }); }}>Follow a campaign</button>
+          <button className="btn ghost" onClick={() => { setAdding("follow"); setFdraft({ name: "", platform: "Kickstarter", url: "", endsAt: "", notes: "" }); }}>Follow a campaign</button>
           <button className="btn ghost" onClick={() => setAdding("paste")}>Paste a list</button>
         </div>
       )}
@@ -1187,6 +1231,8 @@ details.more details.more{background:var(--card)}
 details.more.following{margin:0 0 6px;border:2px solid #C9B8D9;background:#F4EEF8;border-radius:12px}
 details.more.following .list{margin-top:6px}
 .pledge.follow{border-left:5px solid #C9B8D9}
+.pledge.follow .name span.ends{font-weight:700;color:var(--ink)}
+.pledge.follow .name span.ends.over{font-weight:400;color:var(--muted)}
 .nhead{display:flex;justify-content:space-between;gap:10px;align-items:baseline}
 .nhead b{min-width:0;overflow-wrap:anywhere}
 .nhead span{color:var(--muted);font-size:13px;white-space:nowrap}
